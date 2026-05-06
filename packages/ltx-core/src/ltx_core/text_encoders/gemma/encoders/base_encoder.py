@@ -1,10 +1,12 @@
 import functools
 from pathlib import Path
+from typing import Any
 
 import torch
 from transformers import AutoProcessor, Gemma4ForConditionalGeneration
 
 from ltx_core.loader.module_ops import ModuleOps
+from ltx_core.text_encoders.gemma.config import effective_gemma_encode_max_length, resolve_gemma_checkpoint_config
 from ltx_core.text_encoders.gemma.tokenizer import LTXVGemmaTokenizer
 from ltx_core.utils import find_matching_file
 
@@ -174,12 +176,20 @@ def _pad_inputs_for_attention_alignment(
     return model_inputs
 
 
-def module_ops_from_gemma_root(gemma_root: str) -> tuple[ModuleOps, ...]:
+def module_ops_from_gemma_root(
+    gemma_root: str,
+    gemma_hf_config: dict[str, Any] | None = None,
+) -> tuple[ModuleOps, ...]:
     tokenizer_root = str(find_matching_file(gemma_root, "tokenizer.model").parent)
     processor_root = str(find_matching_file(gemma_root, "preprocessor_config.json").parent)
 
+    cfg = gemma_hf_config if gemma_hf_config is not None else resolve_gemma_checkpoint_config(
+        (str(find_matching_file(gemma_root, "model*.safetensors")),)
+    )
+    encode_max_len = effective_gemma_encode_max_length(cfg)
+
     def load_tokenizer(module: GemmaTextEncoder) -> GemmaTextEncoder:
-        module.tokenizer = LTXVGemmaTokenizer(tokenizer_root, 1024)
+        module.tokenizer = LTXVGemmaTokenizer(tokenizer_root, encode_max_len)
         return module
 
     def load_processor(module: GemmaTextEncoder) -> GemmaTextEncoder:

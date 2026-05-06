@@ -235,7 +235,7 @@ def load_text_encoder(
         model_path=weight_paths_t,
         model_class_configurator=GemmaTextEncoderConfigurator,
         model_sd_ops=GEMMA_LLM_KEY_OPS,
-        module_ops=(GEMMA_MODEL_OPS, *module_ops_from_gemma_root(str(gemma_model_path))),
+        module_ops=(GEMMA_MODEL_OPS, *module_ops_from_gemma_root(str(gemma_model_path), gemma_cfg)),
     ).with_checkpoint_config(gemma_cfg).build(device=torch_device, dtype=dtype)
 
     return text_encoder

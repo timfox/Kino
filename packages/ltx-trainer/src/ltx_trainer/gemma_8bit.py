@@ -18,8 +18,13 @@ from pathlib import Path
 
 import torch
 
+from ltx_core.text_encoders.gemma.config import (
+    effective_gemma_encode_max_length,
+    resolve_gemma_checkpoint_config,
+)
 from ltx_core.text_encoders.gemma.encoders.base_encoder import GemmaTextEncoder
 from ltx_core.text_encoders.gemma.tokenizer import LTXVGemmaTokenizer
+from ltx_core.utils import find_matching_file
 
 
 def load_8bit_gemma(gemma_model_path: str | Path, dtype: torch.dtype = torch.bfloat16) -> GemmaTextEncoder:
@@ -46,6 +51,10 @@ def load_8bit_gemma(gemma_model_path: str | Path, dtype: torch.dtype = torch.bfl
     gemma_path = _find_gemma_subpath(gemma_model_path, "model*.safetensors")
     tokenizer_path = _find_gemma_subpath(gemma_model_path, "tokenizer.model")
 
+    weight_file = str(find_matching_file(gemma_model_path, "model*.safetensors"))
+    gemma_cfg = resolve_gemma_checkpoint_config((weight_file,))
+    encode_max_len = effective_gemma_encode_max_length(gemma_cfg)
+
     quantization_config = BitsAndBytesConfig(load_in_8bit=True)
     with _suppress_accelerate_memory_warnings():
         gemma_model = Gemma4ForConditionalGeneration.from_pretrained(
@@ -56,7 +65,7 @@ def load_8bit_gemma(gemma_model_path: str | Path, dtype: torch.dtype = torch.bfl
             local_files_only=True,
         )
 
-    tokenizer = LTXVGemmaTokenizer(tokenizer_path, 1024)
+    tokenizer = LTXVGemmaTokenizer(tokenizer_path, encode_max_len)
 
     return GemmaTextEncoder(
         tokenizer=tokenizer,

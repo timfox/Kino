@@ -337,6 +337,8 @@ The Audio VAE is used internally by pipelines for encoding mel spectrograms to l
 
 LTX-2 uses **Gemma 4** as the multilingual text encoder backbone (see [`src/ltx_core/text_encoders/gemma/`](src/ltx_core/text_encoders/gemma/)), loaded via Hugging Face `Gemma4ForConditionalGeneration` and `Gemma4Config`. You must supply a Gemma 4 `config.json` (or safetensors metadata with `model_type: gemma4`) next to the weight shards—see `resolve_gemma_checkpoint_config` in [`config.py`](src/ltx_core/text_encoders/gemma/config.py). The diffusion checkpoint’s feature extractor was trained for a specific Gemma hidden size and layer count; use an LTX release built for the same Gemma 4 variant you deploy.
 
+Prompt tokenization uses `effective_gemma_encode_max_length()` (same file): the tokenizer’s `max_length` is `min(text_config.max_position_embeddings, cap)` with `cap` defaulting to **8192** so long prompts benefit from Gemma 4’s window without unbounded memory. Set environment variable **`LTX_GEMMA_ENCODE_CAP`** (integer) to lower the cap—for example `1024` to match the historical LTX default.
+
 ### Text Encoder Architecture
 
 The text conditioning pipeline consists of three stages:

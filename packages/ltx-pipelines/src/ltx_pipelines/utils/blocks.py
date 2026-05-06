@@ -365,11 +365,12 @@ class PromptEncoder:
         self._device = device
         self._offload_mode = offload_mode
 
-        module_ops = module_ops_from_gemma_root(gemma_root)
         model_folder = find_matching_file(gemma_root, "model*.safetensors").parent
         weight_paths = [str(p) for p in model_folder.rglob("*.safetensors")]
         weight_paths_t = tuple(weight_paths)
         gemma_cfg = resolve_gemma_checkpoint_config(weight_paths_t)
+
+        module_ops = module_ops_from_gemma_root(gemma_root, gemma_cfg)
 
         self._text_encoder_builder = Builder(
             model_path=weight_paths_t,
