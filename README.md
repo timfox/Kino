@@ -1,4 +1,4 @@
-# LTX-2
+# Kino
 
 [![Website](https://img.shields.io/badge/Website-LTX-181717?logo=google-chrome)](https://ltx.io)
 [![Model](https://img.shields.io/badge/HuggingFace-Model-orange?logo=huggingface)](https://huggingface.co/Lightricks/LTX-2.3)
@@ -6,13 +6,9 @@
 [![Paper](https://img.shields.io/badge/Paper-PDF-EC1C24?logo=adobeacrobatreader&logoColor=white)](https://arxiv.org/abs/2601.03233)
 [![Discord](https://img.shields.io/badge/Join-Discord-5865F2?logo=discord)](https://discord.gg/ltxplatform)
 
-**LTX-2** is the first DiT-based audio-video foundation model that contains all core capabilities of modern video generation in one model: synchronized audio and video, high fidelity, multiple performance modes, production-ready outputs, API access, and open access.
+**Kino** is an expiramental fork of **LTX-2** is the first DiT-based audio-video foundation model that contains all core capabilities of modern video generation in one model: synchronized audio and video, high fidelity, multiple performance modes, production-ready outputs, API access, and open access.
 
-<div align="center">
-  <video src="https://github.com/user-attachments/assets/4414adc0-086c-43de-b367-9362eeb20228" width="70%" poster=""> </video>
-</div>
-
-## 🚀 Quick Start
+## Quick Start
 
 ```bash
 # Clone the repository
@@ -71,7 +67,7 @@ Download the following models from the [LTX-2.3 HuggingFace repository](https://
 * **[RetakePipeline](packages/ltx-pipelines/src/ltx_pipelines/retake.py)** - Regenerate a specific time region of an existing video
 * **[HDRICLoraPipeline](packages/ltx-pipelines/src/ltx_pipelines/hdr_ic_lora.py)** - Video-to-video with HDR output (linear float frames via LogC3 inverse decode, suitable for EXR export and tonemapping)
 
-### ⚡ Optimization Tips
+### Optimization Tips
 
 * **Use DistilledPipeline** - Fastest inference with only 8 predefined sigmas (8 steps stage 1, 4 steps stage 2)
 * **Enable FP8 quantization** - Enables lower memory footprint: `--quantization fp8-cast` (CLI) or `quantization=QuantizationPolicy.fp8_cast()` (Python). Fp8-cast should be used with bf16 checkpoints, it shall downcast them on the fly. For Hopper GPUs with TensorRT-LLM, use `--quantization fp8-scaled-mm` for FP8 scaled matrix multiplication. Fp8-scaled-mm should be used with fp8 checkpoints.
@@ -80,7 +76,7 @@ Download the following models from the [LTX-2.3 HuggingFace repository](https://
 * **Skip memory cleanup** - If you have sufficient VRAM, disable automatic memory cleanup between stages for faster processing
 * **Choose single-stage pipeline** - Use `TI2VidOneStagePipeline` for faster generation when high resolution isn't required
 
-## ✍️ Prompting for LTX-2
+## Prompting for Kino
 
 When writing prompts, focus on detailed, chronological descriptions of actions and scenes. Include specific movements, appearances, camera angles, and environmental details - all in a single flowing paragraph. Start directly with the action, and keep descriptions literal and precise. Think like a cinematographer describing a shot list. Keep within 200 words. For best results, build your prompts using this structure:
 
@@ -98,11 +94,11 @@ For additional guidance on writing a prompt please refer to <https://ltx.video/b
 
 LTX-2 pipelines support automatic prompt enhancement via an `enhance_prompt` parameter.
 
-## 🔌 ComfyUI Integration
+## ComfyUI Integration
 
 To use our model with ComfyUI, please follow the instructions at <https://github.com/Lightricks/ComfyUI-LTXVideo/>.
 
-## 📦 Packages
+## Packages
 
 This repository is organized as a monorepo with three main packages:
 
@@ -112,7 +108,7 @@ This repository is organized as a monorepo with three main packages:
 
 Each package has its own README and documentation. See the [Documentation](#-documentation) section below.
 
-## 📚 Documentation
+## Documentation
 
 Each package includes comprehensive documentation:
 
