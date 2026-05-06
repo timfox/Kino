@@ -91,6 +91,9 @@ class SingleGPUModelBuilder(Generic[ModelType], ModelBuilderProtocol[ModelType],
             ``torch.device("cpu")``, which keeps LoRA weights in CPU memory and transfers them to
             the target GPU sequentially during fusion, reducing peak GPU memory usage compared to
             loading all LoRA weights directly onto the GPU at once.
+        checkpoint_config: When set, used as the model JSON config instead of reading metadata from
+            ``model_path``. Used by the Gemma text encoder to supply ``config.json`` when safetensors
+            metadata is empty.
     """
 
     model_class_configurator: type[ModelConfigurator[ModelType]]
@@ -101,6 +104,7 @@ class SingleGPUModelBuilder(Generic[ModelType], ModelBuilderProtocol[ModelType],
     model_loader: StateDictLoader = field(default_factory=SafetensorsModelStateDictLoader)
     registry: Registry = field(default_factory=DummyRegistry)
     lora_load_device: torch.device = field(default_factory=lambda: torch.device("cpu"))
+    checkpoint_config: dict | None = None
 
     def lora(self, lora_path: str, strength: float = 1.0, sd_ops: SDOps | None = None) -> "SingleGPUModelBuilder":
         return replace(self, loras=(*self.loras, LoraPathStrengthAndSDOps(lora_path, strength, sd_ops)))
@@ -120,7 +124,12 @@ class SingleGPUModelBuilder(Generic[ModelType], ModelBuilderProtocol[ModelType],
     def with_lora_load_device(self, device: torch.device) -> "SingleGPUModelBuilder":
         return replace(self, lora_load_device=device)
 
+    def with_checkpoint_config(self, checkpoint_config: dict | None) -> "SingleGPUModelBuilder":
+        return replace(self, checkpoint_config=checkpoint_config)
+
     def model_config(self) -> dict:
+        if self.checkpoint_config is not None:
+            return self.checkpoint_config
         return read_model_config(self.model_path, self.model_loader)
 
     def meta_model(self, config: dict, module_ops: tuple[ModuleOps, ...]) -> ModelType:

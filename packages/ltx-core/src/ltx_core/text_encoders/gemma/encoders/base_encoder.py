@@ -2,7 +2,7 @@ import functools
 from pathlib import Path
 
 import torch
-from transformers import AutoImageProcessor, Gemma3ForConditionalGeneration, Gemma3Processor
+from transformers import AutoProcessor, Gemma4ForConditionalGeneration
 
 from ltx_core.loader.module_ops import ModuleOps
 from ltx_core.text_encoders.gemma.tokenizer import LTXVGemmaTokenizer
@@ -12,14 +12,14 @@ from ltx_core.utils import find_matching_file
 class GemmaTextEncoder(torch.nn.Module):
     """Pure Gemma text encoder — runs the LLM and returns raw hidden states.
     Prompt enhancement (generate) is also supported since the full
-    Gemma3ForConditionalGeneration model (including lm_head) is loaded.
+    Gemma4ForConditionalGeneration model (including lm_head) is loaded.
     """
 
     def __init__(
         self,
-        model: Gemma3ForConditionalGeneration | None = None,
+        model: Gemma4ForConditionalGeneration | None = None,
         tokenizer: LTXVGemmaTokenizer | None = None,
-        processor: Gemma3Processor | None = None,
+        processor: AutoProcessor | None = None,
         dtype: torch.dtype = torch.bfloat16,
     ):
         super().__init__()
@@ -183,10 +183,10 @@ def module_ops_from_gemma_root(gemma_root: str) -> tuple[ModuleOps, ...]:
         return module
 
     def load_processor(module: GemmaTextEncoder) -> GemmaTextEncoder:
-        image_processor = AutoImageProcessor.from_pretrained(processor_root, local_files_only=True)
         if not module.tokenizer:
             raise ValueError("Tokenizer model operation must be performed before processor model operation")
-        module.processor = Gemma3Processor(image_processor=image_processor, tokenizer=module.tokenizer.tokenizer)
+        # Gemma 4 expects a full processor (image / video / audio + tokenizer) from the same release tree.
+        module.processor = AutoProcessor.from_pretrained(processor_root, local_files_only=True)
         return module
 
     tokenizer_load_ops = ModuleOps(

@@ -59,6 +59,7 @@ from ltx_core.text_encoders.gemma import (
     GemmaTextEncoderConfigurator,
     module_ops_from_gemma_root,
 )
+from ltx_core.text_encoders.gemma.config import resolve_gemma_checkpoint_config
 from ltx_core.text_encoders.gemma.embeddings_processor import EmbeddingsProcessorOutput
 from ltx_core.tools import AudioLatentTools, LatentTools, VideoLatentTools
 from ltx_core.types import Audio, AudioLatentShape, LatentState, VideoLatentShape, VideoPixelShape
@@ -367,23 +368,25 @@ class PromptEncoder:
         module_ops = module_ops_from_gemma_root(gemma_root)
         model_folder = find_matching_file(gemma_root, "model*.safetensors").parent
         weight_paths = [str(p) for p in model_folder.rglob("*.safetensors")]
+        weight_paths_t = tuple(weight_paths)
+        gemma_cfg = resolve_gemma_checkpoint_config(weight_paths_t)
 
         self._text_encoder_builder = Builder(
-            model_path=tuple(weight_paths),
+            model_path=weight_paths_t,
             model_class_configurator=GemmaTextEncoderConfigurator,
             model_sd_ops=GEMMA_LLM_KEY_OPS,
             module_ops=(GEMMA_MODEL_OPS, *module_ops),
             registry=registry or DummyRegistry(),
-        )
+        ).with_checkpoint_config(gemma_cfg)
         self._streaming_text_encoder_builder = StreamingModelBuilder(
-            model_path=tuple(weight_paths),
+            model_path=weight_paths_t,
             model_class_configurator=GemmaTextEncoderConfigurator,
             model_sd_ops=GEMMA_LLM_KEY_OPS,
             module_ops=(GEMMA_MODEL_OPS, *module_ops),
             registry=registry or DummyRegistry(),
             blocks_attr="model.model.language_model.layers",
             blocks_prefix="model.model.language_model.layers",
-        )
+        ).with_checkpoint_config(gemma_cfg)
         self._embeddings_processor_builder = Builder(
             model_path=checkpoint_path,
             model_class_configurator=EmbeddingsProcessorConfigurator,

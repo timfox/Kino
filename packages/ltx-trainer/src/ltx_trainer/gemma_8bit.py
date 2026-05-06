@@ -37,7 +37,7 @@ def load_8bit_gemma(gemma_model_path: str | Path, dtype: torch.dtype = torch.bfl
         FileNotFoundError: If required model files are not found
     """
     try:
-        from transformers import BitsAndBytesConfig, Gemma3ForConditionalGeneration
+        from transformers import BitsAndBytesConfig, Gemma4ForConditionalGeneration
     except ImportError as e:
         raise ImportError(
             "8-bit text encoder loading requires bitsandbytes. Install it with: uv pip install bitsandbytes"
@@ -48,7 +48,7 @@ def load_8bit_gemma(gemma_model_path: str | Path, dtype: torch.dtype = torch.bfl
 
     quantization_config = BitsAndBytesConfig(load_in_8bit=True)
     with _suppress_accelerate_memory_warnings():
-        gemma_model = Gemma3ForConditionalGeneration.from_pretrained(
+        gemma_model = Gemma4ForConditionalGeneration.from_pretrained(
             gemma_path,
             quantization_config=quantization_config,
             torch_dtype=torch.bfloat16,

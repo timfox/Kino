@@ -1,5 +1,6 @@
 """Gemma text encoder components."""
 
+from ltx_core.text_encoders.gemma.config import resolve_gemma_checkpoint_config
 from ltx_core.text_encoders.gemma.embeddings_processor import (
     EmbeddingsProcessor,
     EmbeddingsProcessorOutput,
@@ -30,4 +31,5 @@ __all__ = [
     "GemmaTextEncoderConfigurator",
     "convert_to_additive_mask",
     "module_ops_from_gemma_root",
+    "resolve_gemma_checkpoint_config",
 ]

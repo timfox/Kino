@@ -72,6 +72,7 @@ class StreamingModelBuilder(Generic[ModelType], ModelBuilderProtocol[ModelType])
     blocks_prefix: str = ""
     state_dict_prefix: str = ""
     model_wrapper: Callable[[ModelType], nn.Module] | None = None
+    checkpoint_config: dict | None = None
 
     def with_sd_ops(self, sd_ops: SDOps | None) -> StreamingModelBuilder:
         return replace(self, model_sd_ops=sd_ops)
@@ -82,8 +83,13 @@ class StreamingModelBuilder(Generic[ModelType], ModelBuilderProtocol[ModelType])
     def with_loras(self, loras: tuple[LoraPathStrengthAndSDOps, ...]) -> StreamingModelBuilder:
         return replace(self, loras=loras)
 
+    def with_checkpoint_config(self, checkpoint_config: dict | None) -> StreamingModelBuilder:
+        return replace(self, checkpoint_config=checkpoint_config)
+
     def model_config(self) -> dict:
         """Read model configuration from the checkpoint metadata."""
+        if self.checkpoint_config is not None:
+            return self.checkpoint_config
         return read_model_config(self.model_path, self.model_loader)
 
     def meta_model(self, config: dict, module_ops: tuple[ModuleOps, ...]) -> ModelType:
@@ -111,7 +117,11 @@ class StreamingModelBuilder(Generic[ModelType], ModelBuilderProtocol[ModelType])
             raise ValueError("blocks_prefix must be non-empty for streaming")
 
         # 1. Create meta model (no weights allocated).
-        config = read_model_config(self.model_path, self.model_loader)
+        config = (
+            self.checkpoint_config
+            if self.checkpoint_config is not None
+            else read_model_config(self.model_path, self.model_loader)
+        )
         meta_model: nn.Module = create_meta_model(self.model_class_configurator, config, self.module_ops)
         if self.model_wrapper is not None:
             meta_model = self.model_wrapper(meta_model)

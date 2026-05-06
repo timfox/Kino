@@ -36,7 +36,7 @@ pip install -e packages/ltx-core
 - **Video VAE** ([`model/video_vae/`](src/ltx_core/model/video_vae/)): Encodes/decodes video pixels to/from latent space with temporal and spatial compression
 - **Audio VAE** ([`model/audio_vae/`](src/ltx_core/model/audio_vae/)): Encodes/decodes audio spectrograms to/from latent space
 - **Vocoder** ([`model/audio_vae/`](src/ltx_core/model/audio_vae/)): Neural vocoder that converts mel spectrograms to audio waveforms
-- **Text Encoder** ([`text_encoders/`](src/ltx_core/text_encoders/)): Gemma 3-based multilingual encoder with multi-layer feature extraction and thinking tokens that produces separate embeddings for video and audio conditioning
+- **Text Encoder** ([`text_encoders/`](src/ltx_core/text_encoders/)): Gemma 4-based multilingual encoder (Transformers `Gemma4ForConditionalGeneration`) with multi-layer feature extraction; produces separate embeddings for video and audio conditioning when paired with the LTX checkpoint’s embeddings processor
 - **Spatial Upscaler** ([`model/upsampler/`](src/ltx_core/model/upsampler/)): Upsamples latent representations for higher-resolution generation
 
 ### Diffusion Components
@@ -201,7 +201,7 @@ LTX-2 is an **asymmetric dual-stream diffusion transformer** that jointly models
 │                                                             │
 │  Video Pixels → Video VAE Encoder → Video Latents           │
 │  Audio Waveform → Audio VAE Encoder → Audio Latents         │
-│  Text Prompt → Gemma 3 Encoder → Text Embeddings            │
+│  Text Prompt → Gemma 4 Encoder → Text Embeddings            │
 └─────────────────────────────────────────────────────────────┘
                             ↓
 ┌─────────────────────────────────────────────────────────────┐
@@ -335,13 +335,13 @@ The Audio VAE is used internally by pipelines for encoding mel spectrograms to l
 
 ## Text Encoding (Gemma)
 
-LTX-2 uses **Gemma 3** (Gemma 3-12B) as the multilingual text encoder backbone, located in [`src/ltx_core/text_encoders/gemma/`](src/ltx_core/text_encoders/gemma/). Advanced text understanding is critical not only for global language support but for the phonetic and semantic accuracy of generated speech.
+LTX-2 uses **Gemma 4** as the multilingual text encoder backbone (see [`src/ltx_core/text_encoders/gemma/`](src/ltx_core/text_encoders/gemma/)), loaded via Hugging Face `Gemma4ForConditionalGeneration` and `Gemma4Config`. You must supply a Gemma 4 `config.json` (or safetensors metadata with `model_type: gemma4`) next to the weight shards—see `resolve_gemma_checkpoint_config` in [`config.py`](src/ltx_core/text_encoders/gemma/config.py). The diffusion checkpoint’s feature extractor was trained for a specific Gemma hidden size and layer count; use an LTX release built for the same Gemma 4 variant you deploy.
 
 ### Text Encoder Architecture
 
 The text conditioning pipeline consists of three stages:
 
-1. **Gemma 3 Backbone**: Decoder-only LLM processes text tokens → embeddings across all layers `[B, T, D, L]`
+1. **Gemma 4 Backbone**: Multimodal decoder stack processes text tokens → hidden states across all layers `[B, T, D, L]` (with per-layer embedding / RoPE behavior as defined in Transformers for Gemma 4)
 2. **Multi-Layer Feature Extractor**: Aggregates features from all decoder layers (not just final layer), applies mean-centered scaling, flattens to `[B, T, D×L]`, and projects via learnable matrix W (jointly optimized with LTX-2, LLM weights frozen)
 3. **Text Connector**: Bidirectional transformer blocks with learnable registers (replacing padded positions, also referred to as "thinking tokens" in the paper) for contextual mixing. Separate connectors for video and audio streams (`Embeddings1DConnector`)
 
