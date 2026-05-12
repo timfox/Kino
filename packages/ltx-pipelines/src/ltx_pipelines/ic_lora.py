@@ -37,7 +37,12 @@ from ltx_pipelines.utils.constants import (
     detect_params,
 )
 from ltx_pipelines.utils.denoisers import SimpleDenoiser
-from ltx_pipelines.utils.helpers import assert_resolution, combined_image_conditionings, get_device
+from ltx_pipelines.utils.helpers import (
+    assert_resolution,
+    combined_image_conditionings,
+    get_device,
+    load_mask_video,
+)
 from ltx_pipelines.utils.media_io import decode_video_by_frame, encode_video, video_preprocess
 from ltx_pipelines.utils.types import ModalitySpec, OffloadMode
 
@@ -129,6 +134,7 @@ class ICLoraPipeline:
         images: list[ImageConditioningInput],
         video_conditioning: list[tuple[str, float]],
         enhance_prompt: bool = False,
+        enhance_prompt_prefix: str | None = None,
         tiling_config: TilingConfig | None = None,
         conditioning_attention_strength: float = 1.0,
         skip_stage_2: bool = False,
@@ -182,6 +188,7 @@ class ICLoraPipeline:
             enhance_first_prompt=enhance_prompt,
             enhance_prompt_image=images[0][0] if len(images) > 0 else None,
             enhance_prompt_seed=seed,
+            enhance_prompt_prefix=enhance_prompt_prefix,
         )
         video_context, audio_context = ctx_p.video_encoding, ctx_p.audio_encoding
 
@@ -453,7 +460,7 @@ def main() -> None:
     if args.conditioning_attention_mask is not None:
         mask_path, mask_strength = args.conditioning_attention_mask
         conditioning_attention_strength = mask_strength
-        conditioning_attention_mask = _load_mask_video(
+        conditioning_attention_mask = load_mask_video(
             mask_path=mask_path,
             height=args.height // 2,  # Stage 1 operates at half resolution
             width=args.width // 2,
@@ -493,34 +500,6 @@ def main() -> None:
         output_path=args.output_path,
         video_chunks_number=video_chunks_number,
     )
-
-
-def _load_mask_video(
-    mask_path: str,
-    height: int,
-    width: int,
-    num_frames: int,
-) -> torch.Tensor:
-    """Load a mask video and return a pixel-space tensor of shape (1, 1, F, H, W).
-    The mask video is loaded, resized to (height, width), converted to
-    grayscale, and normalised to [0, 1].
-    Args:
-        mask_path: Path to the mask video file.
-        height: Target height in pixels.
-        width: Target width in pixels.
-        num_frames: Maximum number of frames to load.
-    Returns:
-        Tensor of shape ``(1, 1, F, H, W)`` with values in ``[0, 1]``.
-    """
-    device = get_device()
-    frame_gen = decode_video_by_frame(path=mask_path, frame_cap=num_frames, device=device)
-    mask_video = video_preprocess(frame_gen, height, width, torch.bfloat16, device)
-    # mask_video shape: (1, C, F, H, W) — take mean over channels for grayscale
-    mask = mask_video.mean(dim=1, keepdim=True)  # (1, 1, F, H, W)
-    # Normalise to [0, 1] — video_preprocess applies normalize_latent,
-    # so undo that: values are in [-1, 1], remap to [0, 1]
-    mask = (mask + 1.0) / 2.0
-    return mask.clamp(0.0, 1.0)
 
 
 def _read_lora_reference_downscale_factor(lora_path: str) -> int:

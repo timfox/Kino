@@ -66,6 +66,7 @@ from ltx_core.types import Audio, AudioLatentShape, LatentState, VideoLatentShap
 from ltx_core.utils import find_matching_file
 from ltx_pipelines.utils.gpu_model import gpu_model
 from ltx_pipelines.utils.helpers import (
+    build_reference_aware_prompt,
     cleanup_memory,
     create_noised_state,
     generate_enhanced_prompt,
@@ -407,11 +408,13 @@ class PromptEncoder:
         enhance_first_prompt: bool = False,
         enhance_prompt_image: str | None = None,
         enhance_prompt_seed: int = 42,
+        enhance_prompt_prefix: str | None = None,
     ) -> list[EmbeddingsProcessorOutput]:
         """Encode *prompts* through Gemma -> embeddings processor, freeing each model after use."""
         with self._text_encoder_ctx() as text_encoder:
             if enhance_first_prompt:
                 prompts = list(prompts)
+                prompts[0] = build_reference_aware_prompt(prompts[0], enhance_prompt_prefix)
                 prompts[0] = generate_enhanced_prompt(
                     text_encoder, prompts[0], enhance_prompt_image, seed=enhance_prompt_seed
                 )

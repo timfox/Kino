@@ -114,6 +114,7 @@ class TI2VidTwoStagesPipeline:
         images: list[ImageConditioningInput],
         tiling_config: TilingConfig | None = None,
         enhance_prompt: bool = False,
+        enhance_prompt_prefix: str | None = None,
         max_batch_size: int = 1,
         stage_1_sigmas: torch.Tensor | None = None,
         stage_2_sigmas: torch.Tensor = STAGE_2_DISTILLED_SIGMAS,
@@ -129,6 +130,7 @@ class TI2VidTwoStagesPipeline:
             enhance_first_prompt=enhance_prompt,
             enhance_prompt_image=images[0][0] if len(images) > 0 else None,
             enhance_prompt_seed=seed,
+            enhance_prompt_prefix=enhance_prompt_prefix,
         )
         v_context_p, a_context_p = ctx_p.video_encoding, ctx_p.audio_encoding
         v_context_n, a_context_n = ctx_n.video_encoding, ctx_n.audio_encoding

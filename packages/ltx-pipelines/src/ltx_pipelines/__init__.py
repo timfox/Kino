@@ -1,6 +1,7 @@
 """
 LTX-2 Pipelines: High-level video generation pipelines and utilities.
 This package provides ready-to-use pipelines for video generation:
+- ConsistencyPipeline: Consistency-first wrapper for hero images and reference clips
 - TI2VidOneStagePipeline: Text/image-to-video in a single stage
 - TI2VidTwoStagesPipeline: Two-stage generation with upsampling
 - DistilledPipeline: Fast distilled two-stage generation
@@ -12,6 +13,7 @@ like `ltx_pipelines.utils.media_io` or `ltx_pipelines.utils.constants`.
 """
 
 from ltx_pipelines.a2vid_two_stage import A2VidPipelineTwoStage
+from ltx_pipelines.consistency import ConsistencyPipeline
 from ltx_pipelines.distilled import DistilledPipeline
 from ltx_pipelines.ic_lora import ICLoraPipeline
 from ltx_pipelines.keyframe_interpolation import KeyframeInterpolationPipeline
@@ -21,6 +23,7 @@ from ltx_pipelines.ti2vid_two_stages import TI2VidTwoStagesPipeline
 
 __all__ = [
     "A2VidPipelineTwoStage",
+    "ConsistencyPipeline",
     "DistilledPipeline",
     "ICLoraPipeline",
     "KeyframeInterpolationPipeline",

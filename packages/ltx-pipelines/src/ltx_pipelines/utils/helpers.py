@@ -1,8 +1,10 @@
 import gc
 import logging
+from dataclasses import dataclass
 
 import torch
 
+from ltx_core.components.guiders import MultiModalGuiderParams
 from ltx_core.components.noisers import Noiser
 from ltx_core.conditioning import (
     ConditioningItem,
@@ -16,9 +18,11 @@ from ltx_core.text_encoders.gemma import GemmaTextEncoder
 from ltx_core.tools import LatentTools
 from ltx_core.types import AudioLatentShape, LatentState, VideoLatentShape, VideoPixelShape
 from ltx_pipelines.utils.args import ImageConditioningInput
+from ltx_pipelines.utils.constants import DEFAULT_IMAGE_CRF
 from ltx_pipelines.utils.media_io import (
     decode_audio_from_file,
     decode_image,
+    decode_video_by_frame,
     decode_video_from_file,
     get_videostream_fps,
     load_image_and_preprocess,
@@ -42,6 +46,226 @@ def cleanup_memory() -> None:
             torch._C._host_emptyCache()
     except Exception:
         logging.warning("Host empty cache cleanup failed; ignoring.", exc_info=True)
+
+
+DEFAULT_CONSISTENCY_PRESET = "balanced"
+
+
+@dataclass(frozen=True)
+class ConsistencyKeyframeInput:
+    path: str
+    frame_idx: int
+    strength: float | None = None
+    crf: int = DEFAULT_IMAGE_CRF
+
+
+@dataclass(frozen=True)
+class ConsistencyPreset:
+    hero_image_strength: float
+    keyframe_strength: float
+    reference_video_strength: float
+    mask_strength: float
+    reinforcement_interval: int | None
+    video_cfg_scale: float
+    video_rescale_scale: float
+    a2v_guidance_scale: float
+
+
+@dataclass(frozen=True)
+class ConsistencyPlan:
+    backend: str
+    images: tuple[ImageConditioningInput, ...]
+    video_conditioning: tuple[tuple[str, float], ...]
+    conditioning_attention_mask_path: str | None
+    conditioning_attention_strength: float
+    prompt_reference_hint: str | None
+
+
+CONSISTENCY_PRESETS = {
+    "balanced": ConsistencyPreset(
+        hero_image_strength=0.92,
+        keyframe_strength=0.72,
+        reference_video_strength=0.7,
+        mask_strength=0.9,
+        reinforcement_interval=32,
+        video_cfg_scale=3.2,
+        video_rescale_scale=0.72,
+        a2v_guidance_scale=3.0,
+    ),
+    "strong_identity": ConsistencyPreset(
+        hero_image_strength=0.98,
+        keyframe_strength=0.82,
+        reference_video_strength=0.82,
+        mask_strength=1.0,
+        reinforcement_interval=24,
+        video_cfg_scale=3.6,
+        video_rescale_scale=0.78,
+        a2v_guidance_scale=3.4,
+    ),
+    "masked_subject": ConsistencyPreset(
+        hero_image_strength=0.95,
+        keyframe_strength=0.74,
+        reference_video_strength=0.8,
+        mask_strength=1.0,
+        reinforcement_interval=32,
+        video_cfg_scale=3.4,
+        video_rescale_scale=0.75,
+        a2v_guidance_scale=3.2,
+    ),
+}
+
+
+def _scaled_consistency_strength(base_strength: float, consistency_strength: float) -> float:
+    return max(0.0, min(1.0, base_strength * consistency_strength))
+
+
+def consistency_preset(name: str) -> ConsistencyPreset:
+    try:
+        return CONSISTENCY_PRESETS[name]
+    except KeyError as exc:
+        choices = ", ".join(sorted(CONSISTENCY_PRESETS))
+        raise ValueError(f"Unknown consistency preset '{name}'. Choose from: {choices}") from exc
+
+
+def build_reference_aware_prompt(prompt: str, reference_hint: str | None = None) -> str:
+    if not reference_hint:
+        return prompt
+    return f"{reference_hint.strip()}\n\nScene request: {prompt.strip()}"
+
+
+def build_consistency_guider_params(
+    video_guider_params: MultiModalGuiderParams,
+    audio_guider_params: MultiModalGuiderParams,
+    preset_name: str,
+    consistency_strength: float,
+) -> tuple[MultiModalGuiderParams, MultiModalGuiderParams]:
+    preset = consistency_preset(preset_name)
+    video_scale = max(consistency_strength, 0.0)
+    video_cfg_scale = video_guider_params.cfg_scale + (preset.video_cfg_scale - video_guider_params.cfg_scale) * video_scale
+    video_rescale_scale = video_guider_params.rescale_scale + (
+        preset.video_rescale_scale - video_guider_params.rescale_scale
+    ) * video_scale
+    a2v_guidance_scale = video_guider_params.modality_scale + (
+        preset.a2v_guidance_scale - video_guider_params.modality_scale
+    ) * video_scale
+
+    return (
+        MultiModalGuiderParams(
+            cfg_scale=video_cfg_scale,
+            stg_scale=video_guider_params.stg_scale,
+            rescale_scale=video_rescale_scale,
+            modality_scale=a2v_guidance_scale,
+            skip_step=video_guider_params.skip_step,
+            stg_blocks=list(video_guider_params.stg_blocks),
+        ),
+        MultiModalGuiderParams(
+            cfg_scale=audio_guider_params.cfg_scale,
+            stg_scale=audio_guider_params.stg_scale,
+            rescale_scale=audio_guider_params.rescale_scale,
+            modality_scale=audio_guider_params.modality_scale,
+            skip_step=audio_guider_params.skip_step,
+            stg_blocks=list(audio_guider_params.stg_blocks),
+        ),
+    )
+
+
+def build_consistency_plan(
+    *,
+    num_frames: int,
+    hero_image_path: str | None,
+    keyframes: list[ConsistencyKeyframeInput],
+    reference_video_path: str | None,
+    reference_mask_path: str | None,
+    preset_name: str = DEFAULT_CONSISTENCY_PRESET,
+    consistency_strength: float = 1.0,
+    advanced_images: list[ImageConditioningInput] | None = None,
+) -> ConsistencyPlan:
+    if consistency_strength < 0:
+        raise ValueError(f"consistency_strength must be >= 0, got {consistency_strength}")
+    if reference_mask_path and reference_video_path is None:
+        raise ValueError("reference_mask_path requires reference_video_path")
+    if hero_image_path is None and not keyframes and reference_video_path is None and not advanced_images:
+        raise ValueError("ConsistencyPipeline requires at least one reference image or reference video")
+
+    preset = consistency_preset(preset_name)
+    advanced_images = advanced_images or []
+    planned_images: list[ImageConditioningInput] = []
+    occupied_frames = {image.frame_idx for image in advanced_images}
+
+    def add_image(path: str, frame_idx: int, strength: float, crf: int) -> None:
+        if not 0 <= frame_idx < num_frames:
+            raise ValueError(f"Conditioning frame index {frame_idx} is outside 0..{num_frames - 1}")
+        if frame_idx in occupied_frames:
+            return
+        occupied_frames.add(frame_idx)
+        planned_images.append(ImageConditioningInput(path=path, frame_idx=frame_idx, strength=strength, crf=crf))
+
+    if hero_image_path is not None:
+        add_image(
+            hero_image_path,
+            frame_idx=0,
+            strength=_scaled_consistency_strength(preset.hero_image_strength, consistency_strength),
+            crf=DEFAULT_IMAGE_CRF,
+        )
+
+    for keyframe in sorted(keyframes, key=lambda item: item.frame_idx):
+        add_image(
+            keyframe.path,
+            frame_idx=keyframe.frame_idx,
+            strength=_scaled_consistency_strength(
+                preset.keyframe_strength if keyframe.strength is None else keyframe.strength,
+                consistency_strength,
+            ),
+            crf=keyframe.crf,
+        )
+
+    if hero_image_path is not None and preset.reinforcement_interval is not None:
+        for frame_idx in range(preset.reinforcement_interval, num_frames, preset.reinforcement_interval):
+            add_image(
+                hero_image_path,
+                frame_idx=frame_idx,
+                strength=_scaled_consistency_strength(preset.keyframe_strength, consistency_strength),
+                crf=DEFAULT_IMAGE_CRF,
+            )
+
+    planned_images.extend(advanced_images)
+    planned_images.sort(key=lambda image: image.frame_idx)
+
+    video_conditioning: tuple[tuple[str, float], ...] = ()
+    if reference_video_path is not None:
+        video_conditioning = (
+            (
+                reference_video_path,
+                _scaled_consistency_strength(preset.reference_video_strength, consistency_strength),
+            ),
+        )
+
+    reference_prompt_parts: list[str] = []
+    if hero_image_path is not None:
+        reference_prompt_parts.append(
+            "Preserve the subject identity, facial structure, hair, clothing silhouette, and recognizable features from the reference images across the full shot."
+        )
+    if len(planned_images) > 1:
+        reference_prompt_parts.append(
+            "Respect the supplied keyframes as identity anchors while still allowing natural motion between them."
+        )
+    if reference_video_path is not None:
+        reference_prompt_parts.append(
+            "Use the reference video to preserve subject identity and motion cues without drifting to a different person or costume."
+        )
+    if reference_mask_path is not None:
+        reference_prompt_parts.append(
+            "Keep identity preservation strongest inside the masked subject region while allowing the background to evolve."
+        )
+
+    return ConsistencyPlan(
+        backend="ic_lora" if reference_video_path is not None else "ti2vid",
+        images=tuple(planned_images),
+        video_conditioning=video_conditioning,
+        conditioning_attention_mask_path=reference_mask_path,
+        conditioning_attention_strength=_scaled_consistency_strength(preset.mask_strength, consistency_strength),
+        prompt_reference_hint=" ".join(reference_prompt_parts) if reference_prompt_parts else None,
+    )
 
 
 def _conform_latent_length(latent: torch.Tensor, expected_frames_count: int) -> torch.Tensor:
@@ -325,6 +549,21 @@ def generate_enhanced_prompt(
         prompt = text_encoder.enhance_t2v(prompt, seed=seed)
     logging.info(f"Enhanced prompt: {prompt}")
     return clean_response(prompt)
+
+
+def load_mask_video(
+    mask_path: str,
+    height: int,
+    width: int,
+    num_frames: int,
+) -> torch.Tensor:
+    """Load a grayscale conditioning mask as ``(1, 1, F, H, W)`` in ``[0, 1]``."""
+    device = get_device()
+    frame_gen = decode_video_by_frame(path=mask_path, frame_cap=num_frames, device=device)
+    mask_video = video_preprocess(frame_gen, height, width, torch.bfloat16, device)
+    mask = mask_video.mean(dim=1, keepdim=True)
+    mask = (mask + 1.0) / 2.0
+    return mask.clamp(0.0, 1.0)
 
 
 def assert_resolution(height: int, width: int, is_two_stage: bool) -> None:

@@ -57,6 +57,7 @@ Download the following models from the [LTX-2.3 HuggingFace repository](https://
 ### Available Pipelines
 
 * **[TI2VidTwoStagesPipeline](packages/ltx-pipelines/src/ltx_pipelines/ti2vid_two_stages.py)** - Production-quality text/image-to-video with 2x upsampling (recommended)
+* **[ConsistencyPipeline](packages/ltx-pipelines/src/ltx_pipelines/consistency.py)** - Consistency-first wrapper for hero images, keyframes, and optional reference clips/masks
 * **[TI2VidTwoStagesHQPipeline](packages/ltx-pipelines/src/ltx_pipelines/ti2vid_two_stages_hq.py)** - Same two-stage flow as above but uses the res_2s second-order sampler (fewer steps, better quality)
 * **[TI2VidOneStagePipeline](packages/ltx-pipelines/src/ltx_pipelines/ti2vid_one_stage.py)** - Single-stage generation for quick prototyping
 * **[DistilledPipeline](packages/ltx-pipelines/src/ltx_pipelines/distilled.py)** - Fastest inference with 8 predefined sigmas
@@ -65,6 +66,8 @@ Download the following models from the [LTX-2.3 HuggingFace repository](https://
 * **[A2VidPipelineTwoStage](packages/ltx-pipelines/src/ltx_pipelines/a2vid_two_stage.py)** - Audio-to-video generation conditioned on an input audio file
 * **[RetakePipeline](packages/ltx-pipelines/src/ltx_pipelines/retake.py)** - Regenerate a specific time region of an existing video
 * **[HDRICLoraPipeline](packages/ltx-pipelines/src/ltx_pipelines/hdr_ic_lora.py)** - Video-to-video with HDR output (linear float frames via LogC3 inverse decode, suitable for EXR export and tonemapping)
+
+For identity-heavy generations, start with **ConsistencyPipeline**. It expands a hero image into frame-0 plus periodic reinforcement keyframes, can add explicit keyframes, and switches to IC-LoRA automatically when you also provide a reference clip. Use `balanced` for general work, `strong_identity` when the same subject must hold up under harder scene changes, and `masked_subject` when a subject mask should keep identity pressure concentrated on the foreground person or object.
 
 ### Optimization Tips
 

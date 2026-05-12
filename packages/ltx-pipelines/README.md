@@ -55,6 +55,7 @@ python -m ltx_pipelines.ti2vid_two_stages --help
 
 Available pipeline modules:
 
+- `ltx_pipelines.consistency` - Consistency-first wrapper for hero images, keyframes, reference clips, and masks.
 - `ltx_pipelines.ti2vid_two_stages` - Two-stage text/image-to-video (recommended).
 - `ltx_pipelines.ti2vid_two_stages_hq` - Two-stage text/image-to-video (different sampler, better quality).
 - `ltx_pipelines.ti2vid_one_stage` - Single-stage text/image-to-video.
@@ -74,6 +75,9 @@ Use `--help` with any pipeline module to see all available options and parameter
 ### Quick Decision Tree
 
 ```text
+Do you need stronger subject identity consistency from references?
+├─ YES → Use ConsistencyPipeline
+│
 Do you have an existing video to modify?
 ├─ YES → Use RetakePipeline (regenerate a specific time region)
 │
@@ -104,6 +108,7 @@ Do you need to condition on existing images/videos?
 
 | Pipeline | Stages | [Multimodal Guidance](#%EF%B8%8F-multimodal-guidance) | Upsampling | Conditioning | Best For |
 | -------- | ------ | --- | ---------- | ------------- | -------- |
+| **ConsistencyPipeline** | 2 | ✅ | ✅ | Hero image + keyframes + optional reference video/mask | Identity retention and reference consistency |
 | **TI2VidTwoStagesPipeline** | 2 | ✅ | ✅ | Image | **Production quality** (recommended) |
 | **TI2VidTwoStagesHQPipeline** | 2 | ✅ | ✅ | Image | Same as above, res_2s sampler (higher quality) |
 | **TI2VidOneStagePipeline** | 1 | ✅ | ❌ | Image | Educational, prototyping |
@@ -117,6 +122,49 @@ Do you need to condition on existing images/videos?
 ---
 
 ## 📦 Available Pipelines
+
+### ConsistencyPipeline
+
+**Best for:** Keeping a subject or hero asset stable across a shot while still allowing motion, scene changes, and optional reference-video guidance.
+
+**Source**: [`src/ltx_pipelines/consistency.py`](src/ltx_pipelines/consistency.py)
+
+This wrapper adds a consistency-first workflow on top of the existing TI2Vid and IC-LoRA pipelines. It accepts a **hero image**, optional extra **keyframes**, an optional **reference video**, and an optional **reference mask**. When only still references are provided it dispatches to [`TI2VidTwoStagesPipeline`](src/ltx_pipelines/ti2vid_two_stages.py); when a reference video is provided it dispatches to [`ICLoraPipeline`](src/ltx_pipelines/ic_lora.py). Consistency presets automatically expand the hero image into periodic identity anchors and tune the default conditioning strengths.
+
+**Use when:** You want SeeDance-style identity retention, need a simpler reference workflow than manually combining `--image`, `--video-conditioning`, and conditioning-mask flags, or want one entrypoint for still-reference and reference-video consistency work.
+
+**Example:**
+
+```bash
+python -m ltx_pipelines.consistency \
+    --checkpoint-path path/to/ltx.safetensors \
+    --distilled-lora path/to/distilled_lora.safetensors 0.8 \
+    --spatial-upsampler-path path/to/upsampler.safetensors \
+    --gemma-root path/to/gemma \
+    --prompt "A fashion model turns toward camera under neon lighting." \
+    --hero-image path/to/hero.png \
+    --keyframe path/to/turn_profile.png 48 \
+    --consistency-preset strong_identity \
+    --output-path output.mp4
+```
+
+**Reference clip example:**
+
+```bash
+python -m ltx_pipelines.consistency \
+    --distilled-checkpoint-path path/to/ltx_distilled.safetensors \
+    --ic-lora path/to/ic_lora.safetensors 0.8 \
+    --spatial-upsampler-path path/to/upsampler.safetensors \
+    --gemma-root path/to/gemma \
+    --prompt "The same presenter walks across a studio set and points at a floating display." \
+    --hero-image path/to/hero.png \
+    --reference-video path/to/reference_motion.mp4 \
+    --reference-mask path/to/subject_mask.mp4 \
+    --consistency-preset masked_subject \
+    --output-path output.mp4
+```
+
+---
 
 ### 1. TI2VidTwoStagesPipeline
 
