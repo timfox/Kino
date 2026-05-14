@@ -3,13 +3,13 @@
 from __future__ import annotations
 
 import itertools
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 import torch
 from torch import nn
 
-if TYPE_CHECKING:
-    from ltx_core.block_streaming.pool import BlockLayout
+# Kept local to avoid importing ``pool`` (``pool`` imports this module).
+BlockLayout = dict[str, tuple[torch.Size, torch.dtype]]
 
 
 def resolve_attr(module: nn.Module, dotted_path: str) -> nn.ModuleList:
@@ -50,6 +50,56 @@ def build_pool_layout(block: nn.Module, dtype: torch.dtype) -> BlockLayout:
     for name, tensor in itertools.chain(block.named_parameters(), block.named_buffers()):
         layout[name] = (tensor.shape, dtype)
     return layout
+
+
+def build_pool_layouts(blocks: nn.ModuleList, dtype: torch.dtype) -> list[BlockLayout]:
+    """One layout dict per block (required when blocks are not shape-identical)."""
+    return [build_pool_layout(block, dtype) for block in blocks]
+
+
+def merge_block_layouts_with_checkpoint(
+    meta_layouts: list[BlockLayout],
+    block_tensors: dict[int, dict[str, torch.Tensor]],
+    inference_dtype: torch.dtype,
+) -> list[BlockLayout]:
+    """Use safetensors shapes for each block where available.
+
+    Meta-device stacks (notably Gemma 4) can expose identical parameter
+    shapes on every layer while the checkpoint uses mixed widths. GPU/CPU
+    streaming pools must match the checkpoint, not the meta placeholder.
+    """
+    out: list[BlockLayout] = []
+    for i, ml in enumerate(meta_layouts):
+        ck = block_tensors.get(i, {})
+        merged: BlockLayout = {}
+        for name in ml:
+            if name in ck:
+                merged[name] = (ck[name].shape, inference_dtype)
+            else:
+                merged[name] = ml[name]
+        out.append(merged)
+    return out
+
+
+def layouts_homogeneous(layouts: list[BlockLayout]) -> bool:
+    """Return True if every block shares the same parameter names and tensor shapes."""
+    if not layouts:
+        return True
+    ref = layouts[0]
+    for other in layouts[1:]:
+        if set(ref) != set(other):
+            return False
+        for k in ref:
+            if ref[k][0] != other[k][0]:
+                return False
+    return True
+
+
+def layout_signature(layout: BlockLayout) -> frozenset[tuple[str, tuple[int, ...], str]]:
+    """Stable fingerprint for matching GPU buffers to a block layout."""
+    return frozenset(
+        (name, tuple(shape), str(dt)) for name, (shape, dt) in sorted(layout.items())
+    )
 
 
 def allocate_buffer(layout: BlockLayout, device: torch.device, pin_memory: bool = False) -> dict[str, torch.Tensor]:

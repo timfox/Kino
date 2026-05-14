@@ -1,4 +1,5 @@
 import logging
+import math
 from dataclasses import dataclass, field, replace
 from typing import Generic
 
@@ -36,6 +37,41 @@ def _check_uninitialized(model: nn.Module) -> list[str]:
     return names
 
 
+def _materialize_meta_tensors(model: nn.Module, device: torch.device, dtype: torch.dtype | None) -> None:
+    """Allocate storage for parameters/buffers left on ``meta`` after ``load_state_dict(..., assign=True)``.
+
+    Checkpoints never contain keys for modules constructed only at runtime (for example the experimental
+    ``flat_dim_bridge`` Linear in :class:`EmbeddingsProcessor`). Those stay meta unless we materialize them
+    here; ``Module.to(device)`` cannot move meta tensors on recent PyTorch builds.
+    """
+    for full_name, param in list(model.named_parameters()):
+        if not param.is_meta:
+            continue
+        parent_name, _, leaf = full_name.rpartition(".")
+        parent = model.get_submodule(parent_name) if parent_name else model
+        elem_dtype = dtype if dtype is not None and param.is_floating_point() else param.dtype
+        new_tensor = torch.empty(tuple(param.shape), dtype=elem_dtype, device=device)
+        if leaf == "weight" and isinstance(parent, nn.Linear):
+            torch.nn.init.kaiming_uniform_(new_tensor, a=math.sqrt(5))
+        elif leaf == "bias" and isinstance(parent, nn.Linear) and new_tensor.numel() > 0:
+            fan_in = int(parent.in_features)
+            bound = 1 / math.sqrt(fan_in) if fan_in > 0 else 0.0
+            torch.nn.init.uniform_(new_tensor, -bound, bound)
+        else:
+            torch.nn.init.zeros_(new_tensor)
+        setattr(parent, leaf, nn.Parameter(new_tensor, requires_grad=param.requires_grad))
+
+    for full_name, buf in list(model.named_buffers()):
+        if not buf.is_meta:
+            continue
+        parent_name, _, leaf = full_name.rpartition(".")
+        parent = model.get_submodule(parent_name) if parent_name else model
+        new_buf = torch.empty(tuple(buf.shape), dtype=buf.dtype, device=device)
+        if new_buf.dtype.is_floating_point:
+            torch.nn.init.zeros_(new_buf)
+        parent.register_buffer(leaf, new_buf)
+
+
 def _load_model_weights(
     meta_model: nn.Module,
     model_path: str | tuple[str, ...],
@@ -51,13 +87,18 @@ def _load_model_weights(
     if lora_load_device is None:
         lora_load_device = device
 
-    model_sd = load_state_dict(model_path, loader, registry, device, model_sd_ops)
+    # Staging shards on CPU while the target is CUDA avoids holding an entire ``sd`` dict on GPU during
+    # safetensors iteration (peak VRAM can otherwise overlap prompt-encoder memory and OOM smaller GPUs).
+    load_device = torch.device("cpu") if device.type == "cuda" else device
+    model_sd = load_state_dict(model_path, loader, registry, load_device, model_sd_ops)
 
     lora_strengths = [lora.strength for lora in loras]
     if not lora_strengths or (min(lora_strengths) == 0 and max(lora_strengths) == 0):
         sd = model_sd.sd
         if dtype is not None:
-            sd = {key: value.to(dtype=dtype) for key, value in model_sd.sd.items()}
+            # In-place dtype cast avoids a temporary second full copy of ``sd`` on device.
+            for key in list(sd.keys()):
+                sd[key] = sd[key].to(dtype=dtype)
         meta_model.load_state_dict(sd, strict=False, assign=True)
         return
 
@@ -140,11 +181,14 @@ class SingleGPUModelBuilder(Generic[ModelType], ModelBuilderProtocol[ModelType],
     ) -> StateDict:
         return load_state_dict(paths, self.model_loader, registry, device, sd_ops)
 
-    def _return_model(self, meta_model: ModelType, device: torch.device) -> ModelType:
+    def _return_model(self, meta_model: ModelType, device: torch.device, dtype: torch.dtype | None) -> ModelType:
         uninitialized = _check_uninitialized(meta_model)
         if uninitialized:
-            logger.warning(f"Uninitialized parameters or buffers: {uninitialized}")
-            return meta_model
+            logger.debug("Materializing meta tensors left after checkpoint load: %s", uninitialized)
+            _materialize_meta_tensors(meta_model, device, dtype)
+            still = _check_uninitialized(meta_model)
+            if still:
+                logger.warning("Parameters or buffers still on meta after materialization: %s", still)
         return meta_model.to(device)
 
     def build(
@@ -168,4 +212,4 @@ class SingleGPUModelBuilder(Generic[ModelType], ModelBuilderProtocol[ModelType],
             model_sd_ops=self.model_sd_ops,
             lora_load_device=self.lora_load_device,
         )
-        return self._return_model(meta_model, device)
+        return self._return_model(meta_model, device, dtype)

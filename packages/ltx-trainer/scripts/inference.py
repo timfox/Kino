@@ -24,6 +24,12 @@ Usage:
         --text-encoder-path path/to/gemma \
         --lora-path path/to/lora.safetensors \
         --prompt "A cat in my custom style" --output output.mp4
+    # Same as training with Gemma/LTX flat_dim mismatch (low-rank bridge + optional connector sidecar)
+    python scripts/inference.py --checkpoint path/to/model.safetensors \
+        --text-encoder-path path/to/gemma \
+        --lora-path path/to/lora_weights_step_02000.safetensors \
+        --flat-dim-bridge-rank 32 \
+        --prompt "..." --output output.mp4
 """
 
 import argparse
@@ -36,11 +42,37 @@ from peft import LoraConfig, get_peft_model, set_peft_model_state_dict
 from safetensors.torch import load_file
 from torchvision import transforms
 
-from ltx_trainer.model_loader import load_model
+from ltx_core.text_encoders.gemma.embeddings_processor import EmbeddingsProcessor
+from ltx_trainer.model_loader import load_embeddings_processor, load_model
 from ltx_trainer.progress import StandaloneSamplingProgress
 from ltx_trainer.utils import open_image_as_srgb
 from ltx_trainer.validation_sampler import GenerationConfig, ValidationSampler
 from ltx_trainer.video_utils import read_video, save_video
+
+
+def _load_text_connector_sidecar(embeddings_processor: EmbeddingsProcessor, path: Path) -> None:
+    """Load ``video_connector`` / ``audio_connector`` weights from a trainer sidecar (safetensors)."""
+    sd = load_file(str(path))
+    v_sd = {k[len("video_connector.") :]: v for k, v in sd.items() if k.startswith("video_connector.")}
+    embeddings_processor.video_connector.load_state_dict(v_sd, strict=True)
+    a_sd = {k[len("audio_connector.") :]: v for k, v in sd.items() if k.startswith("audio_connector.")}
+    if a_sd:
+        if embeddings_processor.audio_connector is None:
+            print("Note: text-embed sidecar has audio keys but processor has no audio_connector; audio keys skipped.")
+        else:
+            embeddings_processor.audio_connector.load_state_dict(a_sd, strict=True)
+
+
+def _default_text_embed_sidecar(lora_path: str | None) -> Path | None:
+    """If ``lora_weights_step_*.safetensors`` sits next to ``text_embeds_weights_step_*.safetensors``, return it."""
+    if not lora_path:
+        return None
+    p = Path(lora_path)
+    name = p.name
+    if "lora_weights_step_" not in name:
+        return None
+    sibling = p.with_name(name.replace("lora_weights_", "text_embeds_", 1))
+    return sibling if sibling.is_file() else None
 
 
 def load_image(image_path: str) -> torch.Tensor:
@@ -152,6 +184,25 @@ def main() -> None:  # noqa: PLR0912, PLR0915
         type=str,
         default=None,
         help="Path to LoRA weights (.safetensors)",
+    )
+    parser.add_argument(
+        "--flat-dim-bridge-rank",
+        type=int,
+        default=None,
+        help="When Gemma stacked width differs from the LTX checkpoint (same as training YAML "
+        "model.flat_dim_bridge_rank), set this so the embeddings processor matches training.",
+    )
+    parser.add_argument(
+        "--require-matched-gemma-text-flat-dim",
+        action="store_true",
+        help="Fail if Gemma flat width does not match checkpoint (native geometry only).",
+    )
+    parser.add_argument(
+        "--text-embeds-path",
+        type=str,
+        default=None,
+        help="Optional path to text_embeds_weights_step_*.safetensors (connector fine-tune). "
+        "If omitted and --lora-path is lora_weights_step_*.safetensors, looks for a sibling text_embeds_ file.",
     )
 
     # Generation arguments
@@ -306,6 +357,20 @@ def main() -> None:  # noqa: PLR0912, PLR0915
         text_encoder_path=args.text_encoder_path,
     )
 
+    text_embeds_path = args.text_embeds_path or _default_text_embed_sidecar(args.lora_path)
+    embeddings_processor = load_embeddings_processor(
+        args.checkpoint,
+        device="cpu",
+        dtype=torch.bfloat16,
+        gemma_model_path=args.text_encoder_path,
+        flat_dim_bridge_rank=args.flat_dim_bridge_rank,
+        require_matched_gemma_text_flat_dim=args.require_matched_gemma_text_flat_dim,
+    )
+    if text_embeds_path:
+        p = Path(text_embeds_path)
+        print(f"Loading text connector sidecar from {p}...")
+        _load_text_connector_sidecar(embeddings_processor, p)
+
     # Apply LoRA weights if provided
     transformer = components.transformer
     if args.lora_path is not None:
@@ -397,6 +462,7 @@ def main() -> None:  # noqa: PLR0912, PLR0915
             audio_decoder=components.audio_vae_decoder if generate_audio else None,
             vocoder=components.vocoder if generate_audio else None,
             sampling_context=progress,
+            embeddings_processor=embeddings_processor,
         )
         video, audio = sampler.generate(
             config=gen_config,

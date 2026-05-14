@@ -338,6 +338,8 @@ The multimodal guider combines three guidance signals during each denoising step
 2. **STG (Perturbation Guidance)**: Improves structural coherence by perturbing specific transformer blocks and steering away from the perturbed prediction.
 3. **Modality CFG**: For joint audio-video generation, steers the model away from unsynced video and audio results.
 
+**Implementation (memory):** [`_guided_denoise`](src/ltx_pipelines/utils/denoisers.py) runs **one transformer forward per active pass** (conditional, unconditional, STG perturbation, modality isolation) at the latent batch size, then combines outputs in the guiders. That caps activation memory compared to batching every pass into a single forward. STG and modality isolation still add extra passes versus CFG-only, so they trade speed for quality.
+
 ### Example Configuration
 
 ```python
@@ -372,6 +374,8 @@ audio_guider_params = MultiModalGuiderParams(
 
 
 ### Memory Optimization
+
+**Guided denoising:** With multimodal guidance enabled, peak VRAM is dominated by the largest single forward in [`denoisers.py`](src/ltx_pipelines/utils/denoisers.py) (not the number of passes multiplied into one batch). For tight VRAM, prefer `stg_scale=0.0` / `modality_scale=1.0` / `cfg_scale` near **1.0** on the modality you can relax, and combine with FP8 or weight offloading below.
 
 **FP8 Quantization (Lower Memory Footprint):**
 
@@ -451,7 +455,7 @@ def denoising_loop(sigmas, video_state, audio_state, stepper):
     )
 ```
 
-This allows you to use **20-30 steps instead of 40** while maintaining quality. The gradient estimation function is available in [`pipeline_utils.py`](src/ltx_pipelines/utils/helpers.py).
+This allows you to use **20-30 steps instead of 40** while maintaining quality. The implementation lives in [`samplers.py`](src/ltx_pipelines/utils/samplers.py) and is re-exported from [`ltx_pipelines.utils`](src/ltx_pipelines/utils/__init__.py).
 
 ---
 

@@ -30,6 +30,7 @@ from torch.utils.data import DataLoader
 from torchvision.transforms import functional as F  # noqa: N812
 
 from ltx_core.text_encoders.gemma import convert_to_additive_mask
+from ltx_core.text_encoders.gemma.embeddings_processor import EmbeddingsProcessor
 from ltx_trainer import logger
 from ltx_trainer.config import LtxTrainerConfig
 from ltx_trainer.config_display import print_config
@@ -66,6 +67,38 @@ if not IS_MAIN_PROCESS:
 StepCallback = Callable[[int, int, list[Path]], None]  # (step, total, list[sampled_video_path]) -> None
 
 MEMORY_CHECK_INTERVAL = 200
+
+
+def _text_embed_sidecar_path(main_weights_path: Path) -> Path:
+    """``lora_weights_step_00001.safetensors`` → ``text_embeds_weights_step_00001.safetensors``."""
+    name = main_weights_path.name
+    marker = "weights_step_"
+    if marker in name:
+        idx = name.index(marker)
+        return main_weights_path.with_name(f"text_embeds_{name[idx:]}")
+    return main_weights_path.with_name(f"text_embeds_{name}")
+
+
+def _text_connector_state_dict_for_save(embeddings_processor: EmbeddingsProcessor) -> dict[str, Tensor]:
+    out: dict[str, Tensor] = {}
+    for k, v in embeddings_processor.video_connector.state_dict().items():
+        out[f"video_connector.{k}"] = v.detach()
+    if embeddings_processor.audio_connector is not None:
+        for k, v in embeddings_processor.audio_connector.state_dict().items():
+            out[f"audio_connector.{k}"] = v.detach()
+    return out
+
+
+def _load_text_connector_sidecar(embeddings_processor: EmbeddingsProcessor, path: Path) -> None:
+    sd = load_file(path)
+    v_sd = {k[len("video_connector.") :]: v for k, v in sd.items() if k.startswith("video_connector.")}
+    embeddings_processor.video_connector.load_state_dict(v_sd, strict=True)
+    a_sd = {k[len("audio_connector.") :]: v for k, v in sd.items() if k.startswith("audio_connector.")}
+    if a_sd:
+        if embeddings_processor.audio_connector is None:
+            logger.warning("Text-embed sidecar has audio_connector.* keys but no audio_connector on processor; skipped")
+        else:
+            embeddings_processor.audio_connector.load_state_dict(a_sd, strict=True)
 
 
 class TrainingStats(BaseModel):
@@ -107,6 +140,16 @@ class LtxvTrainer:
         self._training_state_size_warned = False
         self._wandb_run = None
         self._sigma_tracker = SigmaBucketTracker()
+
+        if (
+            self._config.model.finetune_text_connectors
+            and self._config.validation.prompts
+            and self._cached_validation_embeddings
+        ):
+            logger.warning(
+                "model.finetune_text_connectors is on: cached validation prompt embeddings were computed with the "
+                "initial connector weights and will not reflect connector updates during training."
+            )
 
     def train(  # noqa: PLR0912, PLR0915
         self,
@@ -413,6 +456,12 @@ class LtxvTrainer:
             checkpoint_path=self._config.model.model_path,
             device="cuda",
             dtype=torch.bfloat16,
+            gemma_model_path=self._config.model.text_encoder_path,
+            gemma_encode_stack_dims=(
+                dict(self._config.model.gemma_encode_stack_dims) if self._config.model.gemma_encode_stack_dims else None
+            ),
+            require_matched_gemma_text_flat_dim=self._config.model.require_matched_gemma_text_flat_dim,
+            flat_dim_bridge_rank=self._config.model.flat_dim_bridge_rank,
         )
 
         # Cache validation embeddings if prompts are configured
@@ -520,6 +569,36 @@ class LtxvTrainer:
             raise ValueError(f"Unknown training mode: {self._config.model.training_mode}")
 
         self._trainable_params = [p for p in self._transformer.parameters() if p.requires_grad]
+        n_diffusion = sum(p.numel() for p in self._trainable_params)
+        mode = self._config.model.training_mode
+        if self._config.model.finetune_text_connectors:
+            self._embeddings_processor.video_connector.requires_grad_(True)
+            if self._embeddings_processor.audio_connector is not None:
+                self._embeddings_processor.audio_connector.requires_grad_(True)
+            extra = [p for p in self._embeddings_processor.video_connector.parameters() if p.requires_grad]
+            if self._embeddings_processor.audio_connector is not None:
+                extra.extend([p for p in self._embeddings_processor.audio_connector.parameters() if p.requires_grad])
+            self._trainable_params.extend(extra)
+            n_conn = sum(p.numel() for p in extra)
+            n_total = n_diffusion + n_conn
+            logger.info(
+                "Trainable parameters: %s (diffusion, %s) + %s (text embedding connectors) = %s total",
+                f"{n_diffusion:,}",
+                mode,
+                f"{n_conn:,}",
+                f"{n_total:,}",
+            )
+        else:
+            self._embeddings_processor.video_connector.requires_grad_(False)
+            if self._embeddings_processor.audio_connector is not None:
+                self._embeddings_processor.audio_connector.requires_grad_(False)
+            logger.info(
+                "Trainable parameters: %s (%s)%s",
+                f"{n_diffusion:,}",
+                mode,
+                " + LoRA adapters" if mode == "lora" else "",
+            )
+
         logger.debug(f"Trainable params count: {sum(p.numel() for p in self._trainable_params):,}")
 
     def _init_timestep_sampler(self) -> None:
@@ -569,6 +648,7 @@ class LtxvTrainer:
         self._transformer.load_state_dict(state_dict, strict=True)
 
         logger.info("✅ Full model checkpoint loaded successfully")
+        self._maybe_load_text_embed_connector_checkpoint(checkpoint_path)
 
     def _load_lora_checkpoint(self, checkpoint_path: Path) -> None:
         """Load LoRA checkpoint with DDP/FSDP compatibility."""
@@ -583,6 +663,16 @@ class LtxvTrainer:
         set_peft_model_state_dict(base_model, state_dict)
 
         logger.info("✅ LoRA checkpoint loaded successfully")
+        self._maybe_load_text_embed_connector_checkpoint(checkpoint_path)
+
+    def _maybe_load_text_embed_connector_checkpoint(self, main_checkpoint: Path) -> None:
+        if not self._config.model.finetune_text_connectors:
+            return
+        sidecar = _text_embed_sidecar_path(main_checkpoint)
+        if not sidecar.is_file():
+            return
+        _load_text_connector_sidecar(self._embeddings_processor, sidecar)
+        logger.info("Loaded text connector weights from %s", sidecar)
 
     def _resolve_resume_state(self) -> tuple[int, TrainingState | None]:
         """Determine resume state by looking for a training state file next to the loaded checkpoint.
@@ -612,6 +702,10 @@ class LtxvTrainer:
             and fp.lora_rank != cfg.lora.rank
         ):
             mismatches.append(f"lora_rank: {fp.lora_rank} → {cfg.lora.rank}")
+        if bool(fp.finetune_text_connectors) != bool(cfg.model.finetune_text_connectors):
+            mismatches.append(
+                f"finetune_text_connectors: {fp.finetune_text_connectors} → {cfg.model.finetune_text_connectors}"
+            )
         if mismatches:
             logger.warning(
                 f"⚠️ Training state config mismatch ({', '.join(mismatches)}). "
@@ -1053,12 +1147,32 @@ class LtxvTrainer:
 
             # Save to disk with metadata
             save_file(state_dict, saved_weights_path, metadata=metadata)
+            if self._config.model.finetune_text_connectors:
+                te_path = _text_embed_sidecar_path(saved_weights_path)
+                te_sd = _text_connector_state_dict_for_save(self._embeddings_processor)
+                te_sd = {k: v.to(save_dtype) if isinstance(v, Tensor) else v for k, v in te_sd.items()}
+                save_file(te_sd, te_path)
+                logger.info(
+                    "Text connector weights for step %s saved in %s",
+                    self._global_step,
+                    te_path.relative_to(self._config.output_dir),
+                )
         else:
             # Cast to configured precision
             full_state_dict = {k: v.to(save_dtype) if isinstance(v, Tensor) else v for k, v in full_state_dict.items()}
 
             # Save to disk
             self._accelerator.save(full_state_dict, saved_weights_path)
+            if self._config.model.finetune_text_connectors:
+                te_path = _text_embed_sidecar_path(saved_weights_path)
+                te_sd = _text_connector_state_dict_for_save(self._embeddings_processor)
+                te_sd = {k: v.to(save_dtype) if isinstance(v, Tensor) else v for k, v in te_sd.items()}
+                save_file(te_sd, te_path)
+                logger.info(
+                    "Text connector weights for step %s saved in %s",
+                    self._global_step,
+                    te_path.relative_to(self._config.output_dir),
+                )
 
         rel_path = saved_weights_path.relative_to(self._config.output_dir)
         logger.info(f"💾 {prefix.capitalize()} weights for step {self._global_step} saved in {rel_path}")
@@ -1078,6 +1192,10 @@ class LtxvTrainer:
                 if old_checkpoint.exists():
                     old_checkpoint.unlink()
                     logger.info(f"Removed old checkpoint: {old_checkpoint}")
+                te = _text_embed_sidecar_path(old_checkpoint)
+                if te.exists():
+                    te.unlink()
+                    logger.info(f"Removed old text-embed checkpoint: {te}")
             self._checkpoint_paths = self._checkpoint_paths[-self._config.checkpoints.keep_last_n :]
 
     def _save_training_state(self, save_dir: Path) -> None:
@@ -1113,6 +1231,7 @@ class LtxvTrainer:
                 scheduler_type=self._config.optimization.scheduler_type,
                 training_mode=self._config.model.training_mode,
                 lora_rank=self._config.lora.rank if self._config.lora is not None else None,
+                finetune_text_connectors=self._config.model.finetune_text_connectors,
             ),
             rng_states=RngStates(
                 torch_state=torch.random.get_rng_state(),

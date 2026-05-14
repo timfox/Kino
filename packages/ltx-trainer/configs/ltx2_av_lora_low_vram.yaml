@@ -48,6 +48,13 @@ model:
   # Can be a checkpoint file (.safetensors) or directory (uses latest checkpoint)
   load_checkpoint: null
 
+  # Optional — Gemma 4 / LTX text geometry (see GopexLLC tools/LTX_TRAINER.md §6 when widths mismatch):
+  # require_matched_gemma_text_flat_dim: false
+  # gemma_encode_stack_dims: null
+  # flat_dim_bridge_rank: null
+  # finetune_text_connectors: false
+  # For Gemma/LTX mismatch + connectors, see ltx2_av_lora_gemma4_bridge_connectors.yaml (adjust lora rank if you need low VRAM)
+
 # -----------------------------------------------------------------------------
 # LoRA Configuration
 # -----------------------------------------------------------------------------

@@ -98,6 +98,8 @@ training_strategy:
 > Full fine-tuning of LTX-2 requires multiple high-end GPUs (e.g., 4-8× H100 80GB) and distributed
 > training with FSDP. See [Training Guide](training-guide.md) for multi-GPU setup instructions.
 
+When you use the **GopexLLC** repo layout with Gemma 4 and a public LTX checkpoint, text **width** mismatches are common. For **native Gemma 4** (matched `video_aggregate_embed.in_features`, no experimental bridge), see **[`tools/LTX_TRAINER.md` §6.0](../../../../tools/LTX_TRAINER.md)**. For **LoRA vs full diffusion fine-tune vs training embedding connectors**, optional **`flat_dim_bridge_rank`**, and what is *not* implemented yet (training the bridge inside the training loop), see **§6** onward in that file (paths relative to this file: repo root → `tools/LTX_TRAINER.md`).
+
 ## 🔄 In-Context LoRA (IC-LoRA) Training
 
 IC-LoRA is a specialized training mode for video-to-video transformations.

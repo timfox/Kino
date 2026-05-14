@@ -117,11 +117,14 @@ class FeatureExtractorV2(nn.Module):
         video_aggregate_embed: nn.Linear,
         embedding_dim: int,
         audio_aggregate_embed: nn.Linear | None = None,
+        flat_dim_bridge: nn.Module | None = None,
     ):
         super().__init__()
         self.video_aggregate_embed = video_aggregate_embed
         self.audio_aggregate_embed = audio_aggregate_embed
         self.embedding_dim = embedding_dim
+        # Optional projection (dense Linear or low-rank Sequential) for Gemma/LTX flat_dim mismatch experiments.
+        self.flat_dim_bridge = flat_dim_bridge
 
     def forward(
         self,
@@ -132,6 +135,8 @@ class FeatureExtractorV2(nn.Module):
         encoded = torch.stack(hidden_states, dim=-1) if isinstance(hidden_states, (list, tuple)) else hidden_states
         normed = norm_and_concat_per_token_rms(encoded, attention_mask)
         normed = normed.to(encoded.dtype)
+        if self.flat_dim_bridge is not None:
+            normed = self.flat_dim_bridge(normed)
         v_dim = self.video_aggregate_embed.out_features
         video = self.video_aggregate_embed(_rescale_norm(normed, v_dim, self.embedding_dim))
         audio = None

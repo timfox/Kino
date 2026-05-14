@@ -7,22 +7,32 @@ removes the need for :class:`ModelLedger`.
 from __future__ import annotations
 
 import logging
+import os
+import gc
+from collections import Counter
 from collections.abc import Iterator
 from contextlib import AbstractContextManager, contextmanager
 from dataclasses import replace
+from pathlib import Path
 from typing import Callable, TypeVar
 
 import torch
 
 from ltx_core.batch_split import BatchSplitAdapter
 from ltx_core.block_streaming import DISK_CPU_SLOTS, StreamingModelBuilder
+from ltx_core.block_streaming.builder import (
+    expand_ltx_checkpoint_safetensors_paths,
+    infer_ltx_velocity_transformer_blocks_prefix,
+)
 from ltx_core.components.diffusion_steps import EulerDiffusionStep
 from ltx_core.components.noisers import Noiser
 from ltx_core.components.patchifiers import AudioPatchifier, VideoLatentPatchifier
 from ltx_core.components.protocols import DiffusionStepProtocol
 from ltx_core.loader import SDOps
+from ltx_core.loader.helpers import peek_video_aggregate_embed_in_features, read_model_config
 from ltx_core.loader.primitives import LoraPathStrengthAndSDOps
 from ltx_core.loader.registry import DummyRegistry, Registry
+from ltx_core.loader.sft_loader import SafetensorsModelStateDictLoader
 from ltx_core.loader.single_gpu_model_builder import SingleGPUModelBuilder as Builder
 from ltx_core.model.audio_vae import (
     AUDIO_VAE_DECODER_COMFY_KEYS_FILTER,
@@ -76,13 +86,29 @@ from ltx_pipelines.utils.types import Denoiser, ModalitySpec, OffloadMode
 
 logger = logging.getLogger(__name__)
 
-T = TypeVar("T")
-_M = TypeVar("_M", bound=torch.nn.Module)
+_EXPERIMENTAL_ENCODE_FLAT_BRIDGE_ENV = "LTX_EXPERIMENTAL_ENCODE_FLAT_BRIDGE"
+
+
+def _finite_embeddings_processor_output(o: EmbeddingsProcessorOutput) -> EmbeddingsProcessorOutput:
+    """Replace NaN/Inf in text embedding tensors (avoids downstream CUDA asserts with a random flat_dim bridge)."""
+    v = torch.nan_to_num(o.video_encoding)
+    a = o.audio_encoding
+    if a is not None:
+        a = torch.nan_to_num(a)
+    return EmbeddingsProcessorOutput(video_encoding=v, audio_encoding=a, attention_mask=o.attention_mask)
+
+
+def _experimental_encode_flat_bridge_enabled() -> bool:
+    """Opt-in random Linear(actual_flat → checkpoint flat) before ``video_aggregate_embed`` (testing only)."""
+    v = os.environ.get(_EXPERIMENTAL_ENCODE_FLAT_BRIDGE_ENV, "").strip().lower()
+    return v in ("1", "true", "yes", "on")
 
 
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
+T = TypeVar("T")
+_M = TypeVar("_M", bound=torch.nn.Module)
 
 
 @contextmanager
@@ -157,19 +183,26 @@ class DiffusionStage:
         torch_compile: bool = False,
         offload_mode: OffloadMode = OffloadMode.NONE,
     ) -> None:
+        ck_paths = expand_ltx_checkpoint_safetensors_paths(checkpoint_path)
+        model_path: str | tuple[str, ...] = ck_paths[0] if len(ck_paths) == 1 else ck_paths
+
         if offload_mode != OffloadMode.NONE:
             if torch_compile:
                 raise ValueError("torch.compile is not supported with layer streaming")
             if quantization is not None:
                 raise ValueError("quantization is not supported with layer streaming")
+            blocks_prefix = infer_ltx_velocity_transformer_blocks_prefix(
+                model_path, LTXV_MODEL_COMFY_RENAMING_MAP
+            )
+            logger.info("Diffusion layer streaming: blocks_prefix=%r", blocks_prefix)
             self._streaming_builder = StreamingModelBuilder(
                 model_class_configurator=LTXModelConfigurator,
-                model_path=checkpoint_path,
+                model_path=model_path,
                 model_sd_ops=LTXV_MODEL_COMFY_RENAMING_MAP,
                 loras=tuple(loras),
                 registry=registry or DummyRegistry(),
                 blocks_attr="velocity_model.transformer_blocks",
-                blocks_prefix="transformer_blocks",
+                blocks_prefix=blocks_prefix,
                 state_dict_prefix="velocity_model.",
                 model_wrapper=lambda m: X0Model(m).eval(),
             )
@@ -180,7 +213,7 @@ class DiffusionStage:
         self._torch_compile = torch_compile
         self._offload_mode = offload_mode
         self._transformer_builder = Builder(
-            model_path=checkpoint_path,
+            model_path=model_path,
             model_class_configurator=LTXModelConfigurator,
             model_sd_ops=LTXV_MODEL_COMFY_RENAMING_MAP,
             loras=tuple(loras),
@@ -278,13 +311,28 @@ class DiffusionStage:
             audio_state = _build_state(audio, audio_tools, noiser, self._dtype, self._device)
 
         wrapped = BatchSplitAdapter(transformer, max_batch_size=max_batch_size)  # type: ignore[arg-type]
+        if self._device.type == "cuda":
+            gc.collect()
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
+
+        def denoise_fn(
+            video_state: LatentState, audio_state: LatentState, sigmas: torch.Tensor, step_index: int
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            dv, da = denoiser(wrapped, video_state, audio_state, sigmas, step_index)
+            if dv is None or da is None:
+                raise RuntimeError(
+                    "Denoiser returned None for video and/or audio latents; "
+                    "euler/res2s loops require both tensors for this stage."
+                )
+            return dv, da
+
         video_state, audio_state = loop(
             sigmas=sigmas,
             video_state=video_state,
             audio_state=audio_state,
             stepper=stepper,
-            transformer=wrapped,
-            denoiser=denoiser,
+            denoise_fn=denoise_fn,
         )
 
         if video_state is not None and video_tools is not None:
@@ -342,6 +390,100 @@ class DiffusionStage:
             )
 
 
+def _gemma_text_stack_dims_from_hidden_states(hidden_states: tuple[torch.Tensor, ...]) -> dict[str, int] | None:
+    """Infer ``(hidden_size, num_stack)`` from ``output_hidden_states`` (one tensor per stack slot).
+
+    Gemma 4 multimodal / PLE stacks can yield a few odd last-dim outliers while the majority match the LTX
+    training width. We take a unanimous last dim when possible, otherwise the **dominant** last dim if it
+    appears on almost every slice.
+    """
+    if not hidden_states:
+        return None
+    dims = [int(h.shape[-1]) for h in hidden_states]
+    if len(set(dims)) == 1:
+        return {"hidden_size": dims[0], "num_stack": len(dims)}
+    common, cnt = Counter(dims).most_common(1)[0]
+    slack = max(1, len(dims) // 10)
+    if cnt >= len(dims) - slack:
+        return {"hidden_size": common, "num_stack": len(dims)}
+    return None
+
+
+def _reconcile_embedding_stack_dims(
+    hidden_states: tuple[torch.Tensor, ...],
+    stack_dims: dict[str, int] | None,
+    flat_ck: int | None,
+    *,
+    allow_experimental_flat_mismatch: bool = False,
+) -> dict[str, int] | None:
+    """Prefer LTX checkpoint ``flat_dim`` when it matches every slice's last dim and ``len(hidden_states)``."""
+    if not hidden_states or flat_ck is None:
+        return stack_dims
+    n = len(hidden_states)
+    if n <= 0:
+        return stack_dims
+    dims = [int(h.shape[-1]) for h in hidden_states]
+    if flat_ck % n != 0:
+        if allow_experimental_flat_mismatch and len(set(dims)) == 1:
+            return {"hidden_size": dims[0], "num_stack": n}
+        return stack_dims
+    d_need = flat_ck // n
+    if not all(d == d_need for d in dims):
+        if stack_dims is not None and stack_dims["hidden_size"] * stack_dims["num_stack"] == flat_ck:
+            return stack_dims
+        if allow_experimental_flat_mismatch and len(set(dims)) == 1:
+            return {"hidden_size": dims[0], "num_stack": n}
+        raise ValueError(
+            f"LTX checkpoint expects text feature flat_dim={flat_ck} (= {d_need} * {n} slices), but Gemma "
+            f"``output_hidden_states`` last dims are {dims}. Use a Gemma build that matches this LTX encoder, "
+            "or an LTX checkpoint trained for your Gemma revision."
+        )
+    return {"hidden_size": d_need, "num_stack": n}
+
+
+def _gemma_hidden_stack_len_from_loaded_text_encoder(text_encoder: torch.nn.Module) -> int | None:
+    """``len(decoder_layers) + 1`` for the text LM (embedding row + one tensor per decoder layer).
+
+    ``output_hidden_states`` may list **fewer** tensors than this (hook coverage / multimodal wrappers), but
+    LTX ``video_aggregate_embed`` ``in_features`` is sized for the **full** stack implied by the loaded
+    weights (e.g. 70 for 69 Gemma decoder blocks + embedding).
+    """
+    try:
+        root = getattr(text_encoder, "model", None)
+        inner = getattr(root, "model", None) if root is not None else None
+        lm = getattr(inner, "language_model", None) if inner is not None else None
+        layers = getattr(lm, "layers", None) if lm is not None else None
+        if layers is None and lm is not None:
+            inner_lm = getattr(lm, "model", None)
+            layers = getattr(inner_lm, "layers", None) if inner_lm is not None else None
+        if layers is None:
+            return None
+        return int(len(layers)) + 1
+    except Exception:
+        return None
+
+
+def _stack_dims_from_gemma_text_config_if_matches_flat(gemma_cfg: dict, flat_dim: int) -> dict[str, int] | None:
+    """If resolved HF ``text_config`` matches the LTX checkpoint ``flat_dim``, return stack dims.
+
+    LTX aggregate linears are trained for ``hidden_size * (num_hidden_layers + 1)`` (one slice per
+    ``output_hidden_states`` slot). When that product equals *flat_dim* from the diffusion checkpoint,
+    prefer this over ``len(output_hidden_states)``, which can be shorter than the true depth.
+    """
+    tc = gemma_cfg.get("text_config")
+    if not isinstance(tc, dict):
+        return None
+    hs = tc.get("hidden_size")
+    nl = tc.get("num_hidden_layers")
+    if hs is None or nl is None:
+        return None
+    h_i, nl_i, fd_i = int(hs), int(nl), int(flat_dim)
+    n_stack = nl_i + 1
+    if h_i > 0 and n_stack > 0 and h_i * n_stack == fd_i:
+        return {"hidden_size": h_i, "num_stack": n_stack}
+    return None
+
+
 # ---------------------------------------------------------------------------
 # PromptEncoder
 # ---------------------------------------------------------------------------
@@ -389,6 +531,10 @@ class PromptEncoder:
             blocks_attr="model.model.language_model.layers",
             blocks_prefix="model.model.language_model.layers",
         ).with_checkpoint_config(gemma_cfg)
+        ltx_loader = SafetensorsModelStateDictLoader()
+        self._embeddings_ltx_ck = read_model_config(checkpoint_path, ltx_loader)
+        self._embeddings_gemma_cfg = gemma_cfg
+        self._embeddings_ckpt_flat_dim = peek_video_aggregate_embed_in_features(checkpoint_path)
         self._embeddings_processor_builder = Builder(
             model_path=checkpoint_path,
             model_class_configurator=EmbeddingsProcessorConfigurator,
@@ -411,7 +557,9 @@ class PromptEncoder:
         enhance_prompt_prefix: str | None = None,
     ) -> list[EmbeddingsProcessorOutput]:
         """Encode *prompts* through Gemma -> embeddings processor, freeing each model after use."""
+        n_stack_model: int | None = None
         with self._text_encoder_ctx() as text_encoder:
+            n_stack_model = _gemma_hidden_stack_len_from_loaded_text_encoder(text_encoder)
             if enhance_first_prompt:
                 prompts = list(prompts)
                 prompts[0] = build_reference_aware_prompt(prompts[0], enhance_prompt_prefix)
@@ -420,10 +568,90 @@ class PromptEncoder:
                 )
             raw_outputs = [text_encoder.encode(p) for p in prompts]
 
+        cleanup_memory()
+
+        hs0 = raw_outputs[0][0]
+        mp = self._embeddings_processor_builder.model_path
+        ck_path = mp if isinstance(mp, str) else (mp[0] if mp else "")
+        fd = peek_video_aggregate_embed_in_features(ck_path) if ck_path else self._embeddings_ckpt_flat_dim
+        if fd is None:
+            fd = self._embeddings_ckpt_flat_dim
+
+        bridge_on = _experimental_encode_flat_bridge_enabled()
+
+        stack_dims: dict[str, int] | None = None
+        if bridge_on and hs0:
+            inferred_bs = _gemma_text_stack_dims_from_hidden_states(hs0)
+            if inferred_bs is not None:
+                stack_dims = _reconcile_embedding_stack_dims(
+                    hs0, inferred_bs, fd, allow_experimental_flat_mismatch=True
+                )
+
+        if stack_dims is None:
+            if fd is not None:
+                stack_dims = _stack_dims_from_gemma_text_config_if_matches_flat(self._embeddings_gemma_cfg, fd)
+            if stack_dims is None and fd is not None and n_stack_model is not None and n_stack_model > 0 and fd % n_stack_model == 0:
+                stack_dims = {"hidden_size": fd // n_stack_model, "num_stack": n_stack_model}
+            if stack_dims is None:
+                stack_dims = _gemma_text_stack_dims_from_hidden_states(hs0)
+                stack_dims = _reconcile_embedding_stack_dims(
+                    hs0, stack_dims, fd, allow_experimental_flat_mismatch=bridge_on
+                )
+                n = len(hs0)
+                if fd is not None and n > 0 and fd % n == 0:
+                    d_ck = fd // n
+                    if all(int(t.shape[-1]) == d_ck for t in hs0):
+                        stack_dims = {"hidden_size": d_ck, "num_stack": n}
+
+        use_flat_bridge = False
+        if fd is not None and stack_dims is not None:
+            prod = int(stack_dims["hidden_size"]) * int(stack_dims["num_stack"])
+            if prod != fd:
+                if bridge_on:
+                    use_flat_bridge = True
+                    logger.warning(
+                        "%s: Gemma encode flat_dim=%s differs from checkpoint video_aggregate_embed in_features=%s; "
+                        "using a randomly initialized Linear bridge (weak prompt alignment until the connector is retrained).",
+                        _EXPERIMENTAL_ENCODE_FLAT_BRIDGE_ENV,
+                        prod,
+                        fd,
+                    )
+                else:
+                    raise ValueError(
+                        f"LTX embeddings checkpoint expects text feature flat_dim={fd} (video_aggregate_embed in_features), "
+                        f"but the Gemma run resolved to {stack_dims['hidden_size']}×{stack_dims['num_stack']}={prod}. "
+                        "Use a Gemma 4 HF tree whose text_config (hidden_size, num_hidden_layers) matches this LTX build, "
+                        "or an LTX checkpoint trained for your Gemma revision. "
+                        f"For a sub-optimal smoke test only, set {_EXPERIMENTAL_ENCODE_FLAT_BRIDGE_ENV}=1."
+                    )
+        if stack_dims is not None and hs0:
+            eh, en = int(stack_dims["hidden_size"]), int(stack_dims["num_stack"])
+            dims = [int(t.shape[-1]) for t in hs0]
+            if len(hs0) != en or any(d != eh for d in dims):
+                raise ValueError(
+                    f"Gemma encode() returned {len(hs0)} hidden-state tensors (last dims {dims}); "
+                    f"this LTX embeddings pairing expects {en} tensors with last_dim={eh} each "
+                    f"(flat_dim {eh * en})."
+                )
+        gemma_cfg_emb = dict(self._embeddings_gemma_cfg)
+        if stack_dims is not None:
+            gemma_cfg_emb["ltx_encode_stack_dims"] = stack_dims
+        emb_checkpoint = {**self._embeddings_ltx_ck, "gemma_hf_config": gemma_cfg_emb}
+        if stack_dims is not None:
+            emb_checkpoint["ltx_encode_stack_dims"] = stack_dims
+        if fd is not None:
+            emb_checkpoint["ltx_checkpoint_text_flat_dim"] = fd
+        if use_flat_bridge:
+            emb_checkpoint["ltx_experimental_flat_dim_bridge"] = True
+        emb_builder = replace(self._embeddings_processor_builder, checkpoint_config=emb_checkpoint)
+
         with gpu_model(
-            self._embeddings_processor_builder.build(device=self._device, dtype=self._dtype).to(self._device).eval()
+            emb_builder.build(device=self._device, dtype=self._dtype).to(self._device).eval()
         ) as embeddings_processor:
-            return [embeddings_processor.process_hidden_states(hs, mask) for hs, mask in raw_outputs]
+            return [
+                _finite_embeddings_processor_output(embeddings_processor.process_hidden_states(hs, mask))
+                for hs, mask in raw_outputs
+            ]
 
 
 # ---------------------------------------------------------------------------

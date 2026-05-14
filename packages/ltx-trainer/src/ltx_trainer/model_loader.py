@@ -245,28 +245,99 @@ def load_embeddings_processor(
     checkpoint_path: str | Path,
     device: Device = "cpu",
     dtype: torch.dtype = torch.bfloat16,
+    gemma_model_path: str | Path | None = None,
+    *,
+    gemma_encode_stack_dims: dict[str, int] | None = None,
+    require_matched_gemma_text_flat_dim: bool = False,
+    flat_dim_bridge_rank: int | None = None,
 ) -> "EmbeddingsProcessor":
     """Load the embeddings processor (feature extractor + video/audio connectors).
     Args:
         checkpoint_path: Path to the LTX-2 safetensors checkpoint file
         device: Device to load model on
         dtype: Data type for model weights
+        gemma_model_path: Optional Gemma 4 weight tree (same layout as :func:`load_text_encoder`). When set,
+            resolved Hugging Face Gemma ``config`` is merged into the LTX checkpoint metadata so the feature
+            extractor ``flat_dim`` matches the text encoder width and depth (required for checkpoints trained with
+            Gemma 4 26B and similar).
+
+            When the checkpoint's ``video_aggregate_embed`` width (read from safetensors) differs from the Gemma
+            stack's ``hidden_size * num_stack``, the merged config also sets ``ltx_checkpoint_text_flat_dim`` and
+            ``ltx_experimental_flat_dim_bridge`` so weights load (random bridge Linear; prefer a Gemma tree that
+            matches the checkpoint for best prompt fidelity).
+
+        gemma_encode_stack_dims: Optional ``{"hidden_size", "num_stack"}`` merged into the resolved Gemma config
+            (same meaning as ``ltx_encode_stack_dims`` in :mod:`ltx_core`). Use only when HF metadata disagrees with
+            the real ``encode()`` stack.
+
+        require_matched_gemma_text_flat_dim: When true, raise if Gemma flat width and checkpoint ``in_features``
+            disagree instead of enabling the experimental bridge.
+        flat_dim_bridge_rank: When set and the bridge is used, build a low-rank bottleneck instead of a dense
+            ``Linear(flat_in, flat_ck)`` (see ``ltx_experimental_flat_dim_bridge_rank`` in ltx-core).
     Returns:
         Loaded EmbeddingsProcessor with feature extractor and connectors
     """
+    from ltx_core.loader.helpers import peek_video_aggregate_embed_in_features, read_model_config
     from ltx_core.loader.single_gpu_model_builder import SingleGPUModelBuilder
+    from ltx_core.loader.sft_loader import SafetensorsModelStateDictLoader
     from ltx_core.text_encoders.gemma import (
         EMBEDDINGS_PROCESSOR_KEY_OPS,
         EmbeddingsProcessorConfigurator,
     )
+    from ltx_core.text_encoders.gemma.config import resolve_gemma_checkpoint_config
+    from ltx_core.text_encoders.gemma.encoders.encoder_configurator import _gemma_text_stack_dims
+    from ltx_core.utils import find_matching_file
 
     torch_device = _to_torch_device(device)
+    loader = SafetensorsModelStateDictLoader()
 
-    return SingleGPUModelBuilder(
+    builder = SingleGPUModelBuilder(
         model_path=str(checkpoint_path),
         model_class_configurator=EmbeddingsProcessorConfigurator,
         model_sd_ops=EMBEDDINGS_PROCESSOR_KEY_OPS,
-    ).build(device=torch_device, dtype=dtype)
+    )
+    if gemma_model_path is not None:
+        gemma_folder = find_matching_file(str(gemma_model_path), "model*.safetensors").parent
+        weight_paths_t = tuple(str(p) for p in gemma_folder.rglob("*.safetensors"))
+        gemma_cfg = resolve_gemma_checkpoint_config(weight_paths_t)
+        if gemma_encode_stack_dims is not None:
+            gemma_cfg = {**gemma_cfg, "ltx_encode_stack_dims": dict(gemma_encode_stack_dims)}
+        ltx_ck = read_model_config(str(checkpoint_path), loader)
+        merged: dict = {**ltx_ck, "gemma_hf_config": gemma_cfg}
+        flat_ck = peek_video_aggregate_embed_in_features(str(checkpoint_path))
+        hs, ns = _gemma_text_stack_dims(gemma_cfg)
+        gemma_flat = int(hs) * int(ns)
+        if flat_ck is not None and flat_ck != gemma_flat:
+            if require_matched_gemma_text_flat_dim:
+                raise ValueError(
+                    f"Gemma text flat_dim is {gemma_flat} (hidden_size×num_stack from merged HF config) but this LTX "
+                    f"checkpoint expects video_aggregate_embed.in_features={flat_ck}. Use a Gemma release whose "
+                    "stacked encode width matches this checkpoint, use an LTX checkpoint exported for your Gemma "
+                    "tree, or set model.require_matched_gemma_text_flat_dim=false to allow the experimental "
+                    "flat_dim bridge (then re-run process_captions with the same encoder + checkpoint so "
+                    "conditions/*.pt align)."
+                )
+            merged["ltx_checkpoint_text_flat_dim"] = flat_ck
+            merged["ltx_experimental_flat_dim_bridge"] = True
+            if flat_dim_bridge_rank is not None:
+                merged["ltx_experimental_flat_dim_bridge_rank"] = int(flat_dim_bridge_rank)
+            bridge_kind = (
+                f"low-rank bottleneck (rank {int(flat_dim_bridge_rank)})"
+                if flat_dim_bridge_rank is not None
+                else "dense random Linear (very large in bf16)"
+            )
+            logger.warning(
+                "Gemma encode flat_dim (%s) differs from LTX checkpoint video_aggregate_embed in_features (%s). "
+                "Using experimental flat_dim bridge: %s. Prefer matching Gemma/LTX geometry for fidelity. "
+                "Re-run scripts/process_captions.py with the same encoder + checkpoint after changes so "
+                "conditions/*.pt align; training applies connectors on top of those cached tensors.",
+                gemma_flat,
+                flat_ck,
+                bridge_kind,
+            )
+        builder = builder.with_checkpoint_config(merged)
+
+    return builder.build(device=torch_device, dtype=dtype)
 
 
 # =============================================================================

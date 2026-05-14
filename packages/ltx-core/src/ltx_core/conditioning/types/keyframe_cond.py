@@ -37,10 +37,11 @@ class VideoConditionByKeyframeIndex(ConditioningItem):
         latent_state: LatentState,
         latent_tools: VideoLatentTools,
     ) -> LatentState:
-        tokens = latent_tools.patchifier.patchify(self.keyframes)
+        keyframes = self.keyframes.to(device=latent_state.latent.device, dtype=latent_state.latent.dtype)
+        tokens = latent_tools.patchifier.patchify(keyframes)
         latent_coords = latent_tools.patchifier.get_patch_grid_bounds(
-            output_shape=VideoLatentShape.from_torch_shape(self.keyframes.shape),
-            device=self.keyframes.device,
+            output_shape=VideoLatentShape.from_torch_shape(keyframes.shape),
+            device=keyframes.device,
         )
         positions = get_pixel_coords(
             latent_coords=latent_coords,
@@ -60,8 +61,8 @@ class VideoConditionByKeyframeIndex(ConditioningItem):
         denoise_mask = torch.full(
             size=(*tokens.shape[:2], 1),
             fill_value=1.0 - self.strength,
-            device=self.keyframes.device,
-            dtype=self.keyframes.dtype,
+            device=keyframes.device,
+            dtype=keyframes.dtype,
         )
 
         new_attention_mask = update_attention_mask(
@@ -70,8 +71,8 @@ class VideoConditionByKeyframeIndex(ConditioningItem):
             num_noisy_tokens=latent_tools.target_shape.token_count(),
             num_new_tokens=tokens.shape[1],
             batch_size=tokens.shape[0],
-            device=self.keyframes.device,
-            dtype=self.keyframes.dtype,
+            device=keyframes.device,
+            dtype=keyframes.dtype,
         )
 
         return LatentState(

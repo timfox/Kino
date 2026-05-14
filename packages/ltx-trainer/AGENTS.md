@@ -311,6 +311,8 @@ Key classes:
 - Handles mixed precision, gradient accumulation, checkpointing
 - `_training_step()` applies embedding connectors then delegates to strategy
 - `_load_text_encoder_and_cache_embeddings()` loads the text encoder + embeddings processor, caches validation embeddings, then unloads the Gemma LLM (keeps only the embeddings processor connectors for training)
+- Optional `model.finetune_text_connectors` adds connector weights to the optimizer and saves `text_embeds_weights_step_*.safetensors` beside LoRA/full checkpoints (see `ModelConfig` in `config.py`).
+- GopexLLC: full diffusion fine-tune vs LoRA, Gemma 4 / LTX text geometry, bridge limits, and what would be required to train the full text stack are spelled out for operators in **`tools/LTX_TRAINER.md` §6** (sibling doc to kino when using `tools/ltx_trainer_qt.py`).
 - Uses training strategies for mode-specific logic
 
 **`src/ltx_trainer/training_strategies/`** - Strategy pattern

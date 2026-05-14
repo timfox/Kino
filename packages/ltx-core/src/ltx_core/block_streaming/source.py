@@ -43,9 +43,11 @@ class DiskWeightSource(WeightSource):
 
         if len(self._cache) >= self._pool.capacity:
             evicted_idx, evicted_weights = self._cache.popitem(last=False)
-            self._pool.release(evicted_weights, event=self._events.pop(evicted_idx, None))
+            self._pool.release(
+                evicted_weights, event=self._events.pop(evicted_idx, None), block_idx=evicted_idx
+            )
 
-        weights = self._pool.acquire()
+        weights = self._pool.acquire(idx)
         self._reader.read_into(weights, idx)
         self._cache[idx] = weights
         return weights

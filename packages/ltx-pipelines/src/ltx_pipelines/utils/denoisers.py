@@ -4,8 +4,11 @@ Three implementations of the :class:`~ltx_pipelines.utils.types.Denoiser` protoc
 * :class:`GuidedDenoiser` — static guiders, handles CFG + STG + isolated modality.
 * :class:`FactoryGuidedDenoiser` — resolves guiders per-step from sigma.
 ``GuidedDenoiser`` and ``FactoryGuidedDenoiser`` share the core multi-pass
-logic via the module-level :func:`_guided_denoise` function, which batches
-all guidance passes into a single transformer call.
+logic via the module-level :func:`_guided_denoise` function, which runs each
+guidance pass as its own transformer forward (batch ``B``), then combines
+outputs via the guiders. Pass outputs are stashed on **CPU** after each forward
+so multiple CFG/STG/modality passes do not all occupy GPU VRAM at once; tensors
+are moved back to each latent's device only for ``guider.calculate``.
 """
 
 import torch
@@ -32,25 +35,18 @@ def _ensure_guider(guider: MultiModalGuider | None) -> MultiModalGuider:
     return guider if guider is not None else _POSITIVE_ONLY_GUIDER
 
 
-def _repeat_state(state: LatentState, n: int) -> LatentState:
-    """Repeat a ``LatentState`` *n* times along the batch dimension.
-    ``(B, ...) → (n*B, ...)`` by tiling the whole tensor n times, so the
-    ordering is ``[item0, item1, ..., item0, item1, ...]`` — matching
-    ``torch.cat`` of n per-pass contexts.
-    """
+def _pass_output_to_cpu(t: torch.Tensor | float | None) -> torch.Tensor | float | None:
+    """Drop GPU references for a transformer output (keep a detached CPU copy)."""
+    if isinstance(t, torch.Tensor):
+        return t.detach().cpu()
+    return t
 
-    def _repeat(t: torch.Tensor) -> torch.Tensor:
-        repeats = [1] * t.dim()
-        repeats[0] = n
-        return t.repeat(repeats)
 
-    return LatentState(
-        latent=_repeat(state.latent),
-        denoise_mask=_repeat(state.denoise_mask),
-        positions=_repeat(state.positions),
-        clean_latent=_repeat(state.clean_latent),
-        attention_mask=_repeat(state.attention_mask) if state.attention_mask is not None else None,
-    )
+def _to_guider_compute_device(t: torch.Tensor | float | None, device: torch.device | None) -> torch.Tensor | float | None:
+    """Move tensor to *device* for guider fusion; scalars and ``None`` unchanged."""
+    if device is None or not isinstance(t, torch.Tensor):
+        return t
+    return t.to(device=device, non_blocking=True)
 
 
 def _guided_denoise(  # noqa: PLR0913
@@ -67,11 +63,12 @@ def _guided_denoise(  # noqa: PLR0913
     last_denoised_audio: torch.Tensor | None,
     step_index: int,
 ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
-    """Core guided denoising — batches all guidance passes into one transformer call.
-    Collects per-pass contexts first, then builds a single batched Modality
-    per present modality via :func:`modality_from_latent_state`.  When wrapped
-    with :class:`~ltx_core.batch_split.BatchSplitAdapter`, the transformer may
-    split this batch into sequential chunks internally.
+    """Core guided denoising — one transformer forward per guidance pass.
+
+    Each pass uses the original latent batch size ``B`` (typically 1) with that
+    pass's text/audio context, instead of stacking ``n`` passes into one forward
+    with batch ``n*B``. Intermediate outputs live on CPU until
+    ``guider.calculate`` so peak VRAM does not scale with the number of passes.
     Guiders must not be ``None``. For absent modalities, callers should pass
     :data:`_POSITIVE_ONLY_GUIDER` (via :func:`_ensure_guider`) so that only
     the conditioned pass runs and ``calculate()`` returns cond unchanged.
@@ -86,8 +83,6 @@ def _guided_denoise(  # noqa: PLR0913
         raise ValueError("v_context is required when video_state is provided")
     if audio_state is not None and a_context is None:
         raise ValueError("a_context is required when audio_state is provided")
-    # Define passes: (name, video_context, audio_context, perturbation_config).
-    # Context is None for absent modalities — filtered out during collection.
     _pass = tuple[str, torch.Tensor | None, torch.Tensor | None, PerturbationConfig]
     passes: list[_pass] = [("cond", v_context, a_context, PerturbationConfig.empty())]
 
@@ -127,48 +122,53 @@ def _guided_denoise(  # noqa: PLR0913
             )
         )
 
-    # Collect contexts, repeat states, and build batched modalities.
-    pass_names = [name for name, _, _, _ in passes]
-    ptb_configs = [ptb for _, _, _, ptb in passes]
-    n = len(passes)
-
-    def _batched_sigma(state: LatentState) -> torch.Tensor:
-        """Expand scalar sigma to (n * B,) matching the repeated state."""
-        return sigma.expand(state.latent.shape[0] * n)
-
-    batched_video = None
-    if video_state is not None:
-        v_context = torch.cat([vc for _, vc, _, _ in passes], dim=0)
-        batched_video = modality_from_latent_state(
-            _repeat_state(video_state, n),
-            v_context,
-            _batched_sigma(video_state),
-            enabled=not v_skip,
+    results: dict[str, tuple[torch.Tensor | float | None, torch.Tensor | float | None]] = {}
+    for name, vc, ac, ptb in passes:
+        bv = None
+        ba = None
+        if video_state is not None and vc is not None:
+            dev_v = video_state.latent.device
+            sig_v = sigma.expand(video_state.latent.shape[0])
+            bv = modality_from_latent_state(
+                video_state,
+                vc.to(dev_v, non_blocking=True),
+                sig_v,
+                enabled=not v_skip,
+            )
+        if audio_state is not None and ac is not None:
+            dev_a = audio_state.latent.device
+            sig_a = sigma.expand(audio_state.latent.shape[0])
+            ba = modality_from_latent_state(
+                audio_state,
+                ac.to(dev_a, non_blocking=True),
+                sig_a,
+                enabled=not a_skip,
+            )
+        dv, da = transformer(
+            video=bv,
+            audio=ba,
+            perturbations=BatchedPerturbationConfig([ptb]),
         )
+        results[name] = (_pass_output_to_cpu(dv), _pass_output_to_cpu(da))
+        del dv, da
 
-    batched_audio = None
-    if audio_state is not None:
-        a_context = torch.cat([ac for _, _, ac, _ in passes], dim=0)
-        batched_audio = modality_from_latent_state(
-            _repeat_state(audio_state, n),
-            a_context,
-            _batched_sigma(audio_state),
-            enabled=not a_skip,
-        )
+    v_dev = video_state.latent.device if video_state is not None else None
+    a_dev = audio_state.latent.device if audio_state is not None else None
 
-    all_v, all_a = transformer(
-        video=batched_video, audio=batched_audio, perturbations=BatchedPerturbationConfig(ptb_configs)
-    )
+    cond_v, cond_a = results["cond"]
+    uncond_v, uncond_a = results.get("uncond", (0.0, 0.0))
+    ptb_v, ptb_a = results.get("ptb", (0.0, 0.0))
+    mod_v, mod_a = results.get("mod", (0.0, 0.0))
 
-    # Split results back and combine via guiders.
-    splits_v = list(all_v.chunk(n)) if all_v is not None else [0.0] * n
-    splits_a = list(all_a.chunk(n)) if all_a is not None else [0.0] * n
-    r = dict(zip(pass_names, zip(splits_v, splits_a, strict=True), strict=True))
+    cond_v = _to_guider_compute_device(cond_v, v_dev)
+    uncond_v = _to_guider_compute_device(uncond_v, v_dev)
+    ptb_v = _to_guider_compute_device(ptb_v, v_dev)
+    mod_v = _to_guider_compute_device(mod_v, v_dev)
 
-    cond_v, cond_a = r["cond"]
-    uncond_v, uncond_a = r.get("uncond", (0.0, 0.0))
-    ptb_v, ptb_a = r.get("ptb", (0.0, 0.0))
-    mod_v, mod_a = r.get("mod", (0.0, 0.0))
+    cond_a = _to_guider_compute_device(cond_a, a_dev)
+    uncond_a = _to_guider_compute_device(uncond_a, a_dev)
+    ptb_a = _to_guider_compute_device(ptb_a, a_dev)
+    mod_a = _to_guider_compute_device(mod_a, a_dev)
 
     denoised_video = last_denoised_video if v_skip else video_guider.calculate(cond_v, uncond_v, ptb_v, mod_v)
     denoised_audio = last_denoised_audio if a_skip else audio_guider.calculate(cond_a, uncond_a, ptb_a, mod_a)

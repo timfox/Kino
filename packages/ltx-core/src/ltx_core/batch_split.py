@@ -79,10 +79,16 @@ class BatchSplitAdapter(nn.Module):
         a_chunks = audio.split(sizes) if audio is not None else [None] * n
         p_chunks = _split_perturbations(perturbations, sizes)
 
-        chunk_results = [
-            self._model(video=vc, audio=ac, perturbations=pc)
-            for vc, ac, pc in zip(v_chunks, a_chunks, p_chunks, strict=True)
-        ]
+        chunk_results: list[tuple[torch.Tensor | None, torch.Tensor | None]] = []
+        for i, (vc, ac, pc) in enumerate(zip(v_chunks, a_chunks, p_chunks, strict=True)):
+            chunk_results.append(self._model(video=vc, audio=ac, perturbations=pc))
+            if (
+                torch.cuda.is_available()
+                and n > 1
+                and i + 1 < n
+                and str((video or audio).latent.device).startswith("cuda")
+            ):
+                torch.cuda.empty_cache()
 
         results_v, results_a = zip(*chunk_results, strict=True)
         return _merge_tensors(list(results_v)), _merge_tensors(list(results_a))

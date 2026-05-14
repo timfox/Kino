@@ -48,9 +48,9 @@ class WeightsProvider:
         # Evict oldest GPU buffer if at capacity.
         if len(self._cache) >= self._pool.capacity:
             evicted_idx, evicted_weights = self._cache.popitem(last=False)
-            self._pool.release(evicted_weights, event=self._events.pop(evicted_idx, None))
+            self._pool.release(evicted_weights, event=self._events.pop(evicted_idx, None), block_idx=evicted_idx)
 
-        gpu_weights = self._pool.acquire()
+        gpu_weights = self._pool.acquire(idx)
         cpu_weights = self._source.get(idx)
 
         h2d_event = self._copy_to_gpu(idx, gpu_weights, cpu_weights)

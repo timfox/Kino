@@ -1,3 +1,4 @@
+import os
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -10,6 +11,25 @@ from ltx_trainer import logger
 
 # Constants for precomputed data directories
 PRECOMPUTED_DIR_NAME = ".precomputed"
+# Some preprocess scripts omit the leading dot; accept both.
+_PRECOMPUTED_DIR_ALIASES: tuple[str, ...] = (".precomputed", "precomputed")
+# Only fall back to enumerating every subdirectory when there are very few; otherwise a shared ``pytest-*``
+# tmp root (or ``$HOME``) can accidentally match another tree. Otherwise we narrow to the manifest path + hints.
+_FULL_SIBLING_SCAN_MAX = 32
+# When a parent has too many subdirectories, still check these names (if present) for cousin preprocess trees.
+_PRECOMPUTED_SIBLING_HINT_NAMES: tuple[str, ...] = (
+    "outputs",
+    "output",
+    "preprocessed",
+    "preprocess",
+    "export",
+    "exports",
+    "data",
+    "datasets",
+    "tensor_cache",
+    "cache",
+    "artifacts",
+)
 
 
 class DummyDataset(Dataset):
@@ -115,17 +135,210 @@ class PrecomputedDataset(Dataset):
 
     @staticmethod
     def _setup_data_root(data_root: str) -> Path:
-        """Setup and validate the data root directory."""
-        data_root = Path(data_root).expanduser().resolve()
+        """Resolve the directory that contains ``latents/`` and ``conditions/`` (or their ``.precomputed`` parent).
 
-        if not data_root.exists():
-            raise FileNotFoundError(f"Data root directory does not exist: {data_root}")
+        Accepts either:
+        - A **dataset / archive root** that contains a ``.precomputed/`` folder (trainer config style), or
+        - A path inside the tree (e.g. ``.../ltx_manifest``) with tensors stored under ``.precomputed`` on an ancestor.
 
-        # If the given path is the dataset root, use the precomputed subdirectory
-        if (data_root / PRECOMPUTED_DIR_NAME).exists():
-            data_root = data_root / PRECOMPUTED_DIR_NAME
+        Walks from ``data_root`` upward (limited depth). At each directory it checks, in order:
 
-        return data_root
+        - ``<dir>/.precomputed`` or ``<dir>/precomputed`` (must contain ``latents/``),
+        - ``<dir>/latents`` + ``<dir>/conditions`` (flat layout),
+        - **Child folders** of ``<dir>`` (cousin layout), e.g. ``archive/run/.precomputed`` next to
+          ``archive/ltx_manifest``. If ``parent`` has more than ``_FULL_SIBLING_SCAN_MAX`` children, only the
+          subdirectory that continues the path toward ``data_root`` plus a small set of common names are scanned
+          (so ``$HOME`` with many folders does not skip ``~/datasets/...``).
+        """
+        data_root_p = Path(data_root).expanduser().resolve()
+
+        if not data_root_p.exists():
+            raise FileNotFoundError(f"Data root directory does not exist: {data_root_p}")
+
+        cur = data_root_p
+        for step in range(25):
+            hit = PrecomputedDataset._resolve_precomputed_at_dir(cur, data_root_p, step)
+            if hit is not None:
+                return hit
+            hit = PrecomputedDataset._resolve_precomputed_in_child_dirs(cur, data_root_p)
+            if hit is not None:
+                return hit
+            if cur == cur.parent:
+                break
+            cur = cur.parent
+
+        raise FileNotFoundError(
+            f"No {_PRECOMPUTED_DIR_ALIASES[0]!r} / {_PRECOMPUTED_DIR_ALIASES[1]!r} (with latents/) or flat "
+            f"latents/ + conditions/ found starting from {data_root_p} "
+            f"(searched this path, up to 24 parents, and cousin folders — full scan when ≤{_FULL_SIBLING_SCAN_MAX} "
+            f"subdirs, else narrowed along your manifest path + common names). "
+            "Run dataset preprocessing (latents + caption embeddings), or set ``data.preprocessed_data_root`` to the "
+            "folder that contains preprocess output (often a sibling of ``ltx_manifest/`` such as "
+            "``outputs/.precomputed``). If you changed the Gemma / LTX checkpoint, re-run ``process_captions`` so "
+            "``conditions/*.pt`` match the same encoder stack as training."
+        )
+
+    @staticmethod
+    def _precomputed_tree_with_latents(path: Path) -> Path | None:
+        if not path.is_dir():
+            return None
+        return path if (path / "latents").is_dir() else None
+
+    @staticmethod
+    def _find_named_precomputed_under(path: Path) -> Path | None:
+        for name in _PRECOMPUTED_DIR_ALIASES:
+            pc = path / name
+            hit = PrecomputedDataset._precomputed_tree_with_latents(pc)
+            if hit is not None:
+                return hit
+        return None
+
+    @staticmethod
+    def _find_flat_latents_under(path: Path) -> Path | None:
+        if (path / "latents").is_dir() and (path / "conditions").is_dir():
+            return path
+        return None
+
+    @staticmethod
+    def _resolve_precomputed_at_dir(cur: Path, data_root_p: Path, step: int) -> Path | None:
+        hit = PrecomputedDataset._find_named_precomputed_under(cur)
+        if hit is not None:
+            if step > 0 or cur != data_root_p:
+                logger.info(
+                    "Resolved precomputed data root from %s to %s (found after walking up %d level(s)).",
+                    data_root_p,
+                    hit,
+                    step,
+                )
+            return hit
+        hit = PrecomputedDataset._find_flat_latents_under(cur)
+        if hit is not None:
+            if step > 0 or cur != data_root_p:
+                logger.info(
+                    "Resolved precomputed data root from %s to %s (flat latents/ + conditions/ on ancestor).",
+                    data_root_p,
+                    cur,
+                )
+            return hit
+        return None
+
+    @staticmethod
+    def _manifest_path_parts_under_parent(parent_dir: Path, data_root_p: Path) -> tuple[str, ...] | None:
+        """Parts of *data_root_p* relative to *parent_dir* if the manifest path is under that parent.
+
+        Uses :meth:`pathlib.Path.relative_to` when possible, and falls back to a resolved-string prefix so
+        symlink-heavy layouts still narrow sibling scans (e.g. ``$HOME`` → ``datasets``).
+        """
+        pr, dr = parent_dir.resolve(), data_root_p.resolve()
+        try:
+            rel = dr.relative_to(pr)
+            return tuple(rel.parts)
+        except ValueError:
+            pfx = str(pr)
+            if not pfx.endswith(os.sep):
+                pfx = pfx + os.sep
+            ds = str(dr)
+            if not ds.startswith(pfx):
+                return None
+            rest = ds[len(pfx) :].lstrip(os.sep)
+            if not rest:
+                return ()
+            return tuple(Path(rest).parts)
+
+    @staticmethod
+    def _candidate_child_dirs_for_precomputed_scan(parent_dir: Path, data_root_p: Path) -> list[Path]:
+        """Subdirectories of ``parent_dir`` to inspect for ``<child>/.precomputed`` (cousin layout)."""
+        if not parent_dir.is_dir():
+            return []
+        try:
+            kids = sorted((p for p in parent_dir.iterdir() if p.is_dir()), key=lambda p: p.name.lower())
+        except OSError:
+            return []
+
+        out: list[Path] = []
+        seen: set[str] = set()
+
+        def _add(p: Path) -> None:
+            if not p.is_dir():
+                return
+            key = str(p.resolve())
+            if key in seen:
+                return
+            seen.add(key)
+            out.append(p)
+
+        rel_parts = PrecomputedDataset._manifest_path_parts_under_parent(parent_dir, data_root_p)
+        if rel_parts:
+            _add(parent_dir / rel_parts[0])
+
+        for name in _PRECOMPUTED_SIBLING_HINT_NAMES:
+            _add(parent_dir / name)
+
+        # Cousin layout: tensors may live under ``outputs/.precomputed`` or ``tensor_cache/.precomputed`` while the
+        # manifest is only under ``ltx_manifest/``. We must not return as soon as ``relative_to`` adds the manifest
+        # segment — still scan siblings for a valid subtree. When the parent has very many children, cap the scan.
+        heavy = len(kids) > _FULL_SIBLING_SCAN_MAX
+        cap = min(128, len(kids)) if heavy else len(kids)
+        for sub in kids[:cap]:
+            if PrecomputedDataset._find_named_precomputed_under(sub) or PrecomputedDataset._find_flat_latents_under(sub):
+                _add(sub)
+
+        if out:
+            if heavy:
+                logger.info(
+                    "Narrowed precomputed sibling scan under %s (%d subdirectories) to %d candidate folder(s).",
+                    parent_dir,
+                    len(kids),
+                    len(out),
+                )
+            return out
+
+        if len(kids) <= 8:
+            return kids
+
+        logger.warning(
+            "Skipping precomputed sibling scan under %s (%d subdirectories) — could not narrow along the "
+            "configured data path; set ``data.preprocessed_data_root`` explicitly.",
+            parent_dir,
+            len(kids),
+        )
+        return []
+
+    @staticmethod
+    def _resolve_precomputed_in_child_dirs(
+        parent_dir: Path, data_root_p: Path, *, _depth: int = 0
+    ) -> Path | None:
+        """Look for ``<child>/.precomputed`` or flat tensors under subdirectories of ``parent_dir``.
+
+        When ``parent`` has many children, :meth:`_candidate_child_dirs_for_precomputed_scan` narrows the set.
+        If a candidate is an intermediate directory (e.g. ``datasets`` on the way to ``.../ltx_manifest``),
+        recurse one level so ``.../archive/outputs/.precomputed`` is still discoverable.
+        """
+        if _depth > 8:
+            return None
+        for sub in PrecomputedDataset._candidate_child_dirs_for_precomputed_scan(parent_dir, data_root_p):
+            hit = PrecomputedDataset._find_named_precomputed_under(sub)
+            if hit is not None:
+                logger.info(
+                    "Resolved precomputed data root from %s to %s (found under sibling folder %s).",
+                    data_root_p,
+                    hit,
+                    sub.name,
+                )
+                return hit
+            hit = PrecomputedDataset._find_flat_latents_under(sub)
+            if hit is not None:
+                logger.info(
+                    "Resolved precomputed data root from %s to %s (flat tensors under sibling folder %s).",
+                    data_root_p,
+                    hit,
+                    sub.name,
+                )
+                return hit
+            nested = PrecomputedDataset._resolve_precomputed_in_child_dirs(sub, data_root_p, _depth=_depth + 1)
+            if nested is not None:
+                return nested
+        return None
 
     @staticmethod
     def _normalize_data_sources(data_sources: dict[str, str] | list[str] | None) -> dict[str, str]:
@@ -151,7 +364,12 @@ class PrecomputedDataset(Dataset):
 
             # Check that all sources exist.
             if not source_path.exists():
-                raise FileNotFoundError(f"Required {dir_name} directory does not exist: {source_path}")
+                raise FileNotFoundError(
+                    f"Required {dir_name!r} directory does not exist: {source_path}\n"
+                    f"(resolved precomputed data root: {self.data_root}). "
+                    "Expected preprocess output under this root: latents/ and conditions/ "
+                    f"(often inside a {PRECOMPUTED_DIR_NAME}/ or precomputed/ folder next to your dataset manifest)."
+                )
 
         return source_paths
 

@@ -6,8 +6,9 @@ This script provides a command-line interface for preprocessing video datasets b
 latent representations of video clips and text embeddings of their captions. The preprocessed
 data can be used to accelerate training of video generation models and to save GPU memory.
 Basic usage:
-    python scripts/process_dataset.py /path/to/dataset.json --resolution-buckets 768x768x49 \
-        --model-path /path/to/ltx2.safetensors --text-encoder-path /path/to/gemma
+    python scripts/process_dataset.py /path/to/dataset.json --resolution-buckets 768x768x49 \\
+        --model-path /path/to/ltx2.safetensors --text-encoder-path /path/to/gemma \\
+        --flat-dim-bridge-rank 512
 The dataset must be a CSV, JSON, or JSONL file with columns for captions and video paths.
 """
 
@@ -50,6 +51,7 @@ def preprocess_dataset(  # noqa: PLR0913
     reference_downscale_factor: int = 1,
     with_audio: bool = False,
     load_text_encoder_in_8bit: bool = False,
+    flat_dim_bridge_rank: int | None = None,
 ) -> None:
     """Run the preprocessing pipeline with the given arguments."""
     # Validate dataset file
@@ -77,6 +79,7 @@ def preprocess_dataset(  # noqa: PLR0913
             batch_size=batch_size,
             device=device,
             load_in_8bit=load_text_encoder_in_8bit,
+            flat_dim_bridge_rank=flat_dim_bridge_rank,
         )
 
     # Process videos using the dedicated function
@@ -247,6 +250,11 @@ def main(  # noqa: PLR0913
         default=False,
         help="Load the Gemma text encoder in 8-bit precision to save GPU memory (requires bitsandbytes)",
     ),
+    flat_dim_bridge_rank: int | None = typer.Option(
+        default=None,
+        help="When Gemma stacked width mismatches the LTX checkpoint, use low-rank experimental bridge with this rank "
+        "(must match training YAML model.flat_dim_bridge_rank; see tools/LTX_TRAINER.md §6 in GopexLLC).",
+    ),
     reference_downscale_factor: int = typer.Option(
         default=1,
         help="Downscale factor for reference video resolution. When > 1, reference videos are processed at "
@@ -310,6 +318,7 @@ def main(  # noqa: PLR0913
         reference_downscale_factor=reference_downscale_factor,
         with_audio=with_audio,
         load_text_encoder_in_8bit=load_text_encoder_in_8bit,
+        flat_dim_bridge_rank=flat_dim_bridge_rank,
     )
 
 

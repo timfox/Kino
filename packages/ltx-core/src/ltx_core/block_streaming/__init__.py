@@ -9,11 +9,20 @@ source strategies are available:
   disk on demand with FIFO eviction.  Slower, lower CPU memory.
 """
 
-from ltx_core.block_streaming.builder import DISK_CPU_SLOTS, StreamingModelBuilder
+from ltx_core.block_streaming.builder import (
+    DISK_CPU_SLOTS,
+    StreamingModelBuilder,
+    estimate_ltx_velocity_streaming_partition_bytes,
+    expand_ltx_checkpoint_safetensors_paths,
+    infer_ltx_velocity_transformer_blocks_prefix,
+)
 from ltx_core.block_streaming.wrapper import BlockStreamingWrapper
 
 __all__ = [
     "DISK_CPU_SLOTS",
     "BlockStreamingWrapper",
     "StreamingModelBuilder",
+    "estimate_ltx_velocity_streaming_partition_bytes",
+    "expand_ltx_checkpoint_safetensors_paths",
+    "infer_ltx_velocity_transformer_blocks_prefix",
 ]

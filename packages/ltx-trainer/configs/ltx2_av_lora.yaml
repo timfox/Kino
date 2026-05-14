@@ -40,6 +40,13 @@ model:
   # Can be a checkpoint file (.safetensors) or directory (uses latest checkpoint)
   load_checkpoint: null
 
+  # Optional — Gemma 4 / LTX text geometry (see GopexLLC tools/LTX_TRAINER.md §6 when widths mismatch):
+  # require_matched_gemma_text_flat_dim: false   # set true to fail if flat_dim != video_aggregate_embed.in_features
+  # gemma_encode_stack_dims: null               # e.g. {"hidden_size": 2816, "num_stack": 31} if HF config disagrees
+  # flat_dim_bridge_rank: null                  # bottleneck rank for experimental bridge (match process_captions / process_dataset)
+  # finetune_text_connectors: false              # train Embeddings1DConnector with LoRA or full; saves text_embeds_weights_step_*.safetensors
+  # For Gemma/LTX mismatch + connectors on one card, see ltx2_av_lora_gemma4_bridge_connectors.yaml
+
 # -----------------------------------------------------------------------------
 # LoRA Configuration
 # -----------------------------------------------------------------------------

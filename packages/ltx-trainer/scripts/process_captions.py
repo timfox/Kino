@@ -232,6 +232,7 @@ def compute_captions_embeddings(  # noqa: PLR0913
     batch_size: int = 8,
     device: str = "cuda",
     load_in_8bit: bool = False,
+    flat_dim_bridge_rank: int | None = None,
 ) -> None:
     """
     Process captions and save text embeddings.
@@ -247,6 +248,8 @@ def compute_captions_embeddings(  # noqa: PLR0913
         batch_size: Batch size for processing
         device: Device to use for computation
         load_in_8bit: Whether to load the Gemma text encoder in 8-bit precision
+        flat_dim_bridge_rank: When Gemma/LTX flat_dim mismatch enables the experimental bridge, use this bottleneck
+            rank (same as training YAML ``model.flat_dim_bridge_rank``); omit for dense bridge.
     """
 
     console = Console()
@@ -276,6 +279,8 @@ def compute_captions_embeddings(  # noqa: PLR0913
             model_path,
             device=device,
             dtype=torch.bfloat16,
+            gemma_model_path=text_encoder_path,
+            flat_dim_bridge_rank=flat_dim_bridge_rank,
         )
 
     logger.info("Text encoder and embeddings processor loaded successfully")
@@ -387,6 +392,11 @@ def main(  # noqa: PLR0913
         default=False,
         help="Load the Gemma text encoder in 8-bit precision to save GPU memory (requires bitsandbytes)",
     ),
+    flat_dim_bridge_rank: int | None = typer.Option(
+        default=None,
+        help="If Gemma stacked width mismatches the LTX checkpoint, use low-rank experimental bridge with this rank "
+        "(must match training config; default: dense bridge)",
+    ),
 ) -> None:
     """Process text captions and save embeddings for video generation training.
     This script processes captions from metadata files and saves text embeddings
@@ -428,6 +438,7 @@ def main(  # noqa: PLR0913
         batch_size=batch_size,
         device=device,
         load_in_8bit=load_text_encoder_in_8bit,
+        flat_dim_bridge_rank=flat_dim_bridge_rank,
     )
 
 

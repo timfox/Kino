@@ -1,9 +1,43 @@
 from typing import NamedTuple
 
 import torch
+import torch.nn.functional as F
 from torch import nn
 
 from ltx_core.text_encoders.gemma.embeddings_connector import Embeddings1DConnector
+
+
+def _max_learnable_register_stride(*connectors: Embeddings1DConnector | None) -> int:
+    """``Embeddings1DConnector`` requires ``seq_len % num_learnable_registers == 0`` when registers are enabled."""
+    stride = 1
+    for c in connectors:
+        if c is None:
+            continue
+        n = getattr(c, "num_learnable_registers", None)
+        if n:
+            stride = max(stride, int(n))
+    return stride
+
+
+def _pad_seq_to_stride(
+    video_feats: torch.Tensor,
+    audio_feats: torch.Tensor | None,
+    attention_mask: torch.Tensor,
+    stride: int,
+) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor]:
+    """Right-pad sequence dim so connectors' learnable-register tiling can run (default stride 128)."""
+    if stride <= 1:
+        return video_feats, audio_feats, attention_mask
+    t = int(video_feats.shape[1])
+    if t % stride == 0:
+        return video_feats, audio_feats, attention_mask
+    pad_len = stride * ((t + stride - 1) // stride) - t
+    # [B, T, C] — pad T on the right; mask — pad last index dimension with 0 (masked / padding tokens).
+    video_feats = F.pad(video_feats, (0, 0, 0, pad_len))
+    if audio_feats is not None:
+        audio_feats = F.pad(audio_feats, (0, 0, 0, pad_len))
+    attention_mask = F.pad(attention_mask, (0, pad_len), value=0)
+    return video_feats, audio_feats, attention_mask
 
 
 class EmbeddingsProcessorOutput(NamedTuple):
@@ -57,6 +91,18 @@ class EmbeddingsProcessor(nn.Module):
         if self.audio_connector is None and audio_features is not None:
             raise ValueError("Audio features were provided but no audio connector is configured.")
 
+        stride = _max_learnable_register_stride(self.video_connector, self.audio_connector)
+        if stride > 1:
+            t_vid = int(video_features.shape[1])
+            if t_vid % stride != 0:
+                pad_len = stride * ((t_vid + stride - 1) // stride) - t_vid
+                video_features = F.pad(video_features, (0, 0, 0, pad_len))
+                if audio_features is not None:
+                    audio_features = F.pad(audio_features, (0, 0, 0, pad_len))
+                # Padded positions must read as invalid to the connector (same as ``convert_to_additive_mask``).
+                pad_val = -torch.finfo(additive_attention_mask.dtype).max
+                additive_attention_mask = F.pad(additive_attention_mask, (0, pad_len), value=pad_val)
+
         video_encoded, video_mask = self.video_connector(video_features, additive_attention_mask)
         video_encoded, binary_mask = _to_binary_mask(video_encoded, video_mask)
 
@@ -84,6 +130,10 @@ class EmbeddingsProcessor(nn.Module):
             raise ValueError("feature_extractor is required for process_hidden_states()")
 
         video_feats, audio_feats = self.feature_extractor(hidden_states, attention_mask, padding_side)
+        stride = _max_learnable_register_stride(self.video_connector, self.audio_connector)
+        video_feats, audio_feats, attention_mask = _pad_seq_to_stride(
+            video_feats, audio_feats, attention_mask, stride
+        )
         additive_mask = convert_to_additive_mask(attention_mask, video_feats.dtype)
         video_enc, audio_enc, binary_mask = self.create_embeddings(video_feats, audio_feats, additive_mask)
         return EmbeddingsProcessorOutput(video_enc, audio_enc, binary_mask)

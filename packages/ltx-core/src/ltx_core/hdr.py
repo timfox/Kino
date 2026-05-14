@@ -1,6 +1,15 @@
 """HDR utilities: LogC3 compression for HDR IC-LoRA training and inference.
 Provides compress/decompress and postprocess helpers for HDR video generation.
 Used by ltx-pipelines for HDR IC-LoRA and by ltx-trainer for HDR validation.
+
+**LumiVid / latent alignment:** LogC3 maps scene-linear HDR into a range that
+stays within the statistics expected by a **frozen** SDR VAE (see
+`arXiv:2604.11788`, Lightricks *HDR Video Generation via Latent Alignment with
+Logarithmic Encoding*). ``compress`` returns values in ``[0, 1]``; map to the
+VAE's ``[-1, 1]`` input as ``2 * y - 1`` (or your trainer's normalization).
+
+A NumPy-only mirror for tests and scripts lives at ``tools/logc3_numpy.py`` in
+this repository (same constants).
 """
 
 from __future__ import annotations

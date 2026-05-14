@@ -37,6 +37,35 @@ class ModelConfig(ConfigBaseModel):
         "If a directory is provided, the latest checkpoint will be used.",
     )
 
+    gemma_encode_stack_dims: dict[str, int] | None = Field(
+        default=None,
+        description="Optional {'hidden_size', 'num_stack'} merged into Gemma HF config for the embeddings processor "
+        "when metadata disagrees with actual encode() stacking (advanced; must match real hidden states).",
+    )
+
+    require_matched_gemma_text_flat_dim: bool = Field(
+        default=False,
+        description="If true, fail when Gemma stacked width (hidden_size×num_stack) differs from the LTX "
+        "checkpoint's video_aggregate_embed.in_features instead of using the experimental flat_dim bridge. "
+        "Set true for native Gemma 4 geometry (no bridge); keep false only when you intentionally use the bridge.",
+    )
+
+    flat_dim_bridge_rank: int | None = Field(
+        default=None,
+        ge=2,
+        description="When Gemma flat width and the LTX checkpoint disagree and the experimental bridge is enabled, "
+        "use a bottleneck Linear→Linear with this inner rank instead of one dense projection (much smaller; "
+        "suitable if you later train the bridge). Omit for legacy dense random bridge.",
+    )
+
+    finetune_text_connectors: bool = Field(
+        default=False,
+        description="Include video (and audio) embeddings_connector weights in the optimizer. Gradients flow from "
+        "the diffusion loss through precomputed caption features into the connectors. Saved as a sidecar "
+        "text_embeds_weights_step_*.safetensors next to LoRA/full checkpoints. Validation prompts cached at startup "
+        "still use the initial connector weights unless you disable that cache.",
+    )
+
     @field_validator("model_path")
     @classmethod
     def validate_model_path(cls, v: str | Path) -> str | Path:
@@ -49,6 +78,19 @@ class ModelConfig(ConfigBaseModel):
         if not Path(v).exists():
             raise ValueError(f"Model path does not exist: {v}")
 
+        return v
+
+    @field_validator("gemma_encode_stack_dims")
+    @classmethod
+    def validate_gemma_encode_stack_dims(cls, v: dict[str, int] | None) -> dict[str, int] | None:
+        if v is None:
+            return None
+        allowed = {"hidden_size", "num_stack"}
+        extra = set(v) - allowed
+        if extra:
+            raise ValueError(f"gemma_encode_stack_dims: unknown keys {sorted(extra)} (allowed: {sorted(allowed)})")
+        if "hidden_size" not in v or "num_stack" not in v:
+            raise ValueError("gemma_encode_stack_dims must include 'hidden_size' and 'num_stack'")
         return v
 
 

@@ -11,6 +11,7 @@ class ConfigFingerprint(BaseModel):
     scheduler_type: str
     training_mode: str
     lora_rank: int | None = None
+    finetune_text_connectors: bool = False
 
 
 class RngStates(BaseModel):

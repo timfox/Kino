@@ -63,6 +63,41 @@ AUDIO_FREQUENCY_BINS = 16
 DEFAULT_TILE_SIZE = 512  # Spatial tile size in pixels (must be ≥64 and divisible by 32)
 DEFAULT_TILE_OVERLAP = 128  # Spatial tile overlap in pixels (must be divisible by 32)
 
+
+def resolve_dataset_media_path(dataset_file: str | Path, relative: str | Path) -> Path:
+    """Resolve a media path from dataset metadata.
+
+    Relative entries are usually resolved against ``dataset_file.parent``. When the manifest
+    lives in a subfolder (e.g. ``…/ltx_manifest/dataset.json``) but ``media_path`` is anchored at
+    the archive root (e.g. ``data/clip.mp4`` next to ``ltx_manifest/``), walk upward a few
+    directory levels until the file exists.
+    """
+    df = Path(dataset_file).resolve()
+    rel = Path(relative)
+    if rel.is_absolute():
+        return rel
+    cur = df.parent
+    for _ in range(8):
+        candidate = (cur / rel).resolve()
+        if candidate.is_file():
+            return candidate
+        parent = cur.parent
+        if parent == cur:
+            break
+        cur = parent
+    return (df.parent / rel).resolve()
+
+
+def manifest_relative_posix(raw: str) -> str:
+    """Normalize a manifest path for output keys (``data/foo.pt`` under ``latents/``)."""
+    return Path(raw.strip()).as_posix()
+
+
+def _clamp_tensor_01_inplace(tensor: torch.Tensor) -> torch.Tensor:
+    """Clamp to ``[0, 1]`` in place. Module-level so ``MediaDataset`` is picklable for DataLoader workers (Py 3.14+)."""
+    return tensor.clamp_(0.0, 1.0)
+
+
 app = typer.Typer(
     pretty_exceptions_enable=False,
     no_args_is_help=True,
@@ -107,11 +142,11 @@ class MediaDataset(Dataset):
         self.reshape_mode = reshape_mode
         self.with_audio = with_audio
 
-        # First load main media paths
-        self.main_media_paths = self._load_video_paths(main_media_column)
+        # First load main media paths (resolved on disk) and manifest-relative keys for output layout
+        self.main_media_paths, self.main_media_relpaths = self._load_video_paths_with_relpaths(main_media_column)
 
-        # Then load reference video paths
-        self.video_paths = self._load_video_paths(video_column)
+        # Then load reference / alternate video paths
+        self.video_paths, self.video_relpaths = self._load_video_paths_with_relpaths(video_column)
 
         # Filter out videos with insufficient frames
         self._filter_valid_videos()
@@ -121,7 +156,7 @@ class MediaDataset(Dataset):
         # Set up video transforms
         self.transforms = transforms.Compose(
             [
-                transforms.Lambda(lambda x: x.clamp_(0, 1)),
+                transforms.Lambda(_clamp_tensor_01_inplace),
                 transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5], inplace=True),
             ]
         )
@@ -137,10 +172,8 @@ class MediaDataset(Dataset):
 
         video_path: Path = self.video_paths[index]
 
-        # Compute relative path of the video
-        data_root = self.dataset_file.parent
-        relative_path = str(video_path.relative_to(data_root))
-        media_relative_path = str(self.main_media_paths[index].relative_to(data_root))
+        media_relative_path = self.main_media_relpaths[index]
+        relative_path = self.video_relpaths[index]
 
         if video_path.suffix.lower() in [".png", ".jpg", ".jpeg"]:
             media_tensor = self._preprocess_image(video_path)
@@ -207,8 +240,8 @@ class MediaDataset(Dataset):
             logger.debug(f"Could not extract audio from {video_path}: {e}")
             return None
 
-    def _load_video_paths(self, column: str) -> list[Path]:
-        """Load video paths from the specified data source."""
+    def _load_video_paths_with_relpaths(self, column: str) -> tuple[list[Path], list[str]]:
+        """Load resolved filesystem paths and manifest-relative POSIX paths for output naming."""
         if self.dataset_file.suffix == ".csv":
             return self._load_video_paths_from_csv(column)
         elif self.dataset_file.suffix == ".json":
@@ -218,23 +251,23 @@ class MediaDataset(Dataset):
         else:
             raise ValueError("Expected `dataset_file` to be a path to a CSV, JSON, or JSONL file.")
 
-    def _load_video_paths_from_csv(self, column: str) -> list[Path]:
+    def _load_video_paths_from_csv(self, column: str) -> tuple[list[Path], list[str]]:
         """Load video paths from a CSV file."""
         df = pd.read_csv(self.dataset_file)
         if column not in df.columns:
             raise ValueError(f"Column '{column}' not found in CSV file")
 
-        data_root = self.dataset_file.parent
-        video_paths = [data_root / Path(line.strip()) for line in df[column].tolist()]
+        raw = [str(line).strip() for line in df[column].tolist()]
+        relpaths = [manifest_relative_posix(x) for x in raw]
+        video_paths = [resolve_dataset_media_path(self.dataset_file, x) for x in raw]
 
-        # Validate that all paths exist
         invalid_paths = [path for path in video_paths if not path.is_file()]
         if invalid_paths:
             raise ValueError(f"Found {len(invalid_paths)} invalid video paths. First few: {invalid_paths[:5]}")
 
-        return video_paths
+        return video_paths, relpaths
 
-    def _load_video_paths_from_json(self, column: str) -> list[Path]:
+    def _load_video_paths_from_json(self, column: str) -> tuple[list[Path], list[str]]:
         """Load video paths from a JSON file."""
         with open(self.dataset_file, "r", encoding="utf-8") as file:
             data = json.load(file)
@@ -242,49 +275,55 @@ class MediaDataset(Dataset):
         if not isinstance(data, list):
             raise ValueError("JSON file must contain a list of objects")
 
-        data_root = self.dataset_file.parent
-        video_paths = []
+        raw: list[str] = []
         for entry in data:
             if column not in entry:
                 raise ValueError(f"Key '{column}' not found in JSON entry")
-            video_paths.append(data_root / Path(entry[column].strip()))
+            raw.append(str(entry[column]).strip())
 
-        # Validate that all paths exist
+        relpaths = [manifest_relative_posix(x) for x in raw]
+        video_paths = [resolve_dataset_media_path(self.dataset_file, x) for x in raw]
+
         invalid_paths = [path for path in video_paths if not path.is_file()]
         if invalid_paths:
             raise ValueError(f"Found {len(invalid_paths)} invalid video paths. First few: {invalid_paths[:5]}")
 
-        return video_paths
+        return video_paths, relpaths
 
-    def _load_video_paths_from_jsonl(self, column: str) -> list[Path]:
+    def _load_video_paths_from_jsonl(self, column: str) -> tuple[list[Path], list[str]]:
         """Load video paths from a JSONL file."""
-        data_root = self.dataset_file.parent
-        video_paths = []
+        raw: list[str] = []
         with open(self.dataset_file, "r", encoding="utf-8") as file:
             for line in file:
                 entry = json.loads(line)
                 if column not in entry:
                     raise ValueError(f"Key '{column}' not found in JSONL entry")
-                video_paths.append(data_root / Path(entry[column].strip()))
+                raw.append(str(entry[column]).strip())
 
-        # Validate that all paths exist
+        relpaths = [manifest_relative_posix(x) for x in raw]
+        video_paths = [resolve_dataset_media_path(self.dataset_file, x) for x in raw]
+
         invalid_paths = [path for path in video_paths if not path.is_file()]
         if invalid_paths:
             raise ValueError(f"Found {len(invalid_paths)} invalid video paths. First few: {invalid_paths[:5]}")
 
-        return video_paths
+        return video_paths, relpaths
 
     def _filter_valid_videos(self) -> None:
         """Filter out videos with insufficient frames."""
         original_length = len(self.video_paths)
         valid_video_paths = []
         valid_main_media_paths = []
+        valid_video_relpaths = []
+        valid_main_media_relpaths = []
         min_frames_required = min(self.resolution_buckets, key=lambda x: x[0])[0]
 
         for i, video_path in enumerate(self.video_paths):
             if video_path.suffix.lower() in [".png", ".jpg", ".jpeg"]:
                 valid_video_paths.append(video_path)
                 valid_main_media_paths.append(self.main_media_paths[i])
+                valid_video_relpaths.append(self.video_relpaths[i])
+                valid_main_media_relpaths.append(self.main_media_relpaths[i])
                 continue
 
             try:
@@ -293,6 +332,8 @@ class MediaDataset(Dataset):
                 if frame_count >= min_frames_required:
                     valid_video_paths.append(video_path)
                     valid_main_media_paths.append(self.main_media_paths[i])
+                    valid_video_relpaths.append(self.video_relpaths[i])
+                    valid_main_media_relpaths.append(self.main_media_relpaths[i])
                 else:
                     logger.warning(
                         f"Skipping video at {video_path} - has {frame_count} frames, "
@@ -304,6 +345,8 @@ class MediaDataset(Dataset):
         # Update both path lists to maintain synchronization
         self.video_paths = valid_video_paths
         self.main_media_paths = valid_main_media_paths
+        self.video_relpaths = valid_video_relpaths
+        self.main_media_relpaths = valid_main_media_relpaths
 
         if len(self.video_paths) < original_length:
             logger.warning(

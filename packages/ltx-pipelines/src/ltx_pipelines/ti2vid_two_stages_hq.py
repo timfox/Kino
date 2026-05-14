@@ -28,12 +28,17 @@ from ltx_pipelines.utils.constants import (
 from ltx_pipelines.utils.denoisers import GuidedDenoiser, SimpleDenoiser
 from ltx_pipelines.utils.helpers import (
     assert_resolution,
+    cleanup_memory,
     combined_image_conditionings,
     get_device,
+    offload_image_conditioning_latents_to_cpu,
+    offload_tensors_to_cpu_for_diffusion,
 )
 from ltx_pipelines.utils.media_io import encode_video
 from ltx_pipelines.utils.samplers import res2s_audio_video_denoising_loop
 from ltx_pipelines.utils.types import ModalitySpec, OffloadMode
+
+logger = logging.getLogger(__name__)
 
 
 class TI2VidTwoStagesHQPipeline:
@@ -46,6 +51,11 @@ class TI2VidTwoStagesHQPipeline:
     Uses the res_2s second-order sampler instead of Euler, allowing fewer
     steps for comparable quality. Supports optional image conditioning via
     the images parameter.
+
+    Optional ``secondary_device`` splits work like :class:`TI2VidTwoStagesPipeline`
+    (Gemma follows the same VRAM heuristic: smaller secondary → Gemma on primary; Gemma
+    offload matches ``offload_mode`` when it is ``CPU``/``DISK`` so the full LLM is not
+    held on the primary before stage-1 denoise).
     """
 
     def __init__(  # noqa: PLR0913
@@ -62,10 +72,39 @@ class TI2VidTwoStagesHQPipeline:
         registry: Registry | None = None,
         torch_compile: bool = False,
         offload_mode: OffloadMode = OffloadMode.NONE,
+        secondary_device: torch.device | None = None,
     ):
         self.device = device or get_device()
         self.dtype = torch.bfloat16
         self._scheduler = LTX2Scheduler()
+
+        sec = secondary_device
+        if sec is not None:
+            if self.device.type != "cuda" or sec.type != "cuda":
+                raise ValueError("secondary_device is only supported when the primary device is CUDA")
+            if sec.index == self.device.index:
+                sec = None
+        self._secondary_device = sec
+        self._stage_2_device = sec if sec is not None else self.device
+        if sec is not None:
+            prim_mem = torch.cuda.get_device_properties(self.device.index).total_memory
+            sec_mem = torch.cuda.get_device_properties(sec.index).total_memory
+            if sec_mem < prim_mem:
+                prompt_encoder_device = self.device
+                prompt_offload = offload_mode if offload_mode != OffloadMode.NONE else OffloadMode.NONE
+                logger.info(
+                    "Dual-GPU: Gemma on CUDA %d; stage-2 + upsampler on CUDA %d. Gemma offload=%s "
+                    "(matches diffusion offload when diffusion uses cpu/disk).",
+                    self.device.index,
+                    sec.index,
+                    prompt_offload.value,
+                )
+            else:
+                prompt_encoder_device = self._stage_2_device
+                prompt_offload = offload_mode
+        else:
+            prompt_encoder_device = self.device
+            prompt_offload = offload_mode
 
         distilled_lora_stage_1 = LoraPathStrengthAndSDOps(
             path=distilled_lora[0].path,
@@ -79,11 +118,16 @@ class TI2VidTwoStagesHQPipeline:
         )
 
         self.prompt_encoder = PromptEncoder(
-            checkpoint_path, gemma_root, self.dtype, self.device, registry=registry, offload_mode=offload_mode
+            checkpoint_path,
+            gemma_root,
+            self.dtype,
+            prompt_encoder_device,
+            registry=registry,
+            offload_mode=prompt_offload,
         )
         self.image_conditioner = ImageConditioner(checkpoint_path, self.dtype, self.device, registry=registry)
         self.upsampler = VideoUpsampler(
-            checkpoint_path, spatial_upsampler_path, self.dtype, self.device, registry=registry
+            checkpoint_path, spatial_upsampler_path, self.dtype, self._stage_2_device, registry=registry
         )
         self.video_decoder = VideoDecoder(checkpoint_path, self.dtype, self.device, registry=registry)
         self.audio_decoder = AudioDecoder(checkpoint_path, self.dtype, self.device, registry=registry)
@@ -101,7 +145,7 @@ class TI2VidTwoStagesHQPipeline:
         self.stage_2 = DiffusionStage(
             checkpoint_path,
             self.dtype,
-            self.device,
+            self._stage_2_device,
             loras=(*loras, distilled_lora_stage_2),
             quantization=quantization,
             registry=registry,
@@ -128,11 +172,17 @@ class TI2VidTwoStagesHQPipeline:
         max_batch_size: int = 1,
         stage_1_sigmas: torch.Tensor | None = None,
         stage_2_sigmas: torch.Tensor = STAGE_2_DISTILLED_SIGMAS,
+        hdr_experimental_lumivid_logc3: bool = False,
     ) -> tuple[Iterator[torch.Tensor], Audio]:
         assert_resolution(height=height, width=width, is_two_stage=True)
 
         generator = torch.Generator(device=self.device).manual_seed(seed)
-        noiser = GaussianNoiser(generator=generator)
+        noiser_stage_1 = GaussianNoiser(generator=generator)
+        noiser_stage_2 = (
+            noiser_stage_1
+            if self._stage_2_device == self.device
+            else GaussianNoiser(generator=torch.Generator(device=self._stage_2_device).manual_seed(seed))
+        )
         dtype = torch.bfloat16
 
         ctx_p, ctx_n = self.prompt_encoder(
@@ -143,6 +193,11 @@ class TI2VidTwoStagesHQPipeline:
         )
         v_context_p, a_context_p = ctx_p.video_encoding, ctx_p.audio_encoding
         v_context_n, a_context_n = ctx_n.video_encoding, ctx_n.audio_encoding
+        del ctx_p, ctx_n
+        v_context_p, a_context_p, v_context_n, a_context_n = offload_tensors_to_cpu_for_diffusion(
+            v_context_p, a_context_p, v_context_n, a_context_n
+        )
+        cleanup_memory()
 
         # Stage 1: Generate video at half resolution with CFG guidance using res2s sampler.
         stage_1_output_shape = VideoPixelShape(
@@ -162,6 +217,8 @@ class TI2VidTwoStagesHQPipeline:
                 device=self.device,
             )
         )
+        offload_image_conditioning_latents_to_cpu(stage_1_conditionings)
+        cleanup_memory()
 
         stepper = Res2sDiffusionStep()
 
@@ -184,7 +241,7 @@ class TI2VidTwoStagesHQPipeline:
                 ),
             ),
             sigmas=sigmas,
-            noiser=noiser,
+            noiser=noiser_stage_1,
             stepper=stepper,
             width=stage_1_output_shape.width,
             height=stage_1_output_shape.height,
@@ -197,9 +254,12 @@ class TI2VidTwoStagesHQPipeline:
         )
 
         # Stage 2: Upsample and refine the video at higher resolution with distilled LoRA.
-        upscaled_video_latent = self.upsampler(video_state.latent[:1])
+        v_up_in = video_state.latent[:1]
+        if self._stage_2_device != self.device:
+            v_up_in = v_up_in.to(self._stage_2_device, non_blocking=True)
+        upscaled_video_latent = self.upsampler(v_up_in)
 
-        stage_2_sigmas = stage_2_sigmas.to(dtype=torch.float32, device=self.device)
+        stage_2_sigmas = stage_2_sigmas.to(dtype=torch.float32, device=self._stage_2_device)
         stage_2_output_shape = VideoPixelShape(batch=1, frames=num_frames, width=width, height=height, fps=frame_rate)
         stage_2_conditionings = self.image_conditioner(
             lambda enc: combined_image_conditionings(
@@ -211,11 +271,17 @@ class TI2VidTwoStagesHQPipeline:
                 device=self.device,
             )
         )
+        offload_image_conditioning_latents_to_cpu(stage_2_conditionings)
+        cleanup_memory()
+
+        audio_latent_s2 = audio_state.latent
+        if self._stage_2_device != self.device:
+            audio_latent_s2 = audio_latent_s2.to(self._stage_2_device, non_blocking=True)
 
         video_state, audio_state = self.stage_2(
             denoiser=SimpleDenoiser(v_context=v_context_p, a_context=a_context_p),
             sigmas=stage_2_sigmas,
-            noiser=noiser,
+            noiser=noiser_stage_2,
             stepper=stepper,
             width=width,
             height=height,
@@ -230,13 +296,23 @@ class TI2VidTwoStagesHQPipeline:
             audio=ModalitySpec(
                 context=a_context_p,
                 noise_scale=stage_2_sigmas[0].item(),
-                initial_latent=audio_state.latent,
+                initial_latent=audio_latent_s2,
             ),
             loop=res2s_audio_video_denoising_loop,
+            max_batch_size=max_batch_size,
         )
 
-        decoded_video = self.video_decoder(video_state.latent, tiling_config, generator)
-        decoded_audio = self.audio_decoder(audio_state.latent)
+        v_lat = video_state.latent
+        a_lat = audio_state.latent
+        if self._stage_2_device != self.device:
+            v_lat = v_lat.to(self.device, non_blocking=True)
+            a_lat = a_lat.to(self.device, non_blocking=True)
+
+        decode_dtype = torch.float32 if hdr_experimental_lumivid_logc3 else torch.uint8
+        decoded_video = self.video_decoder(
+            v_lat, tiling_config, generator, output_dtype=decode_dtype
+        )
+        decoded_audio = self.audio_decoder(a_lat)
         return decoded_video, decoded_audio
 
 

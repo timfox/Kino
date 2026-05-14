@@ -52,7 +52,11 @@ class AudioProcessor(nn.Module):
         mel = torch.log(torch.clamp(mel, min=1e-5))
 
         mel = mel.to(device=waveform.device, dtype=waveform.dtype)
-        return mel.permute(0, 1, 3, 2).contiguous()
+        mel = mel.permute(0, 1, 3, 2).contiguous()
+        # Encoder ``conv_in`` is trained for two mel channels (stereo); mono waveforms yield one — duplicate.
+        if mel.shape[1] == 1:
+            mel = mel.repeat(1, 2, 1, 1)
+        return mel
 
 
 class PerChannelStatistics(nn.Module):

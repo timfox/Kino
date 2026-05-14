@@ -6,13 +6,15 @@ import torch
 
 @dataclass(frozen=True, slots=True)
 class ContentReplacement:
-    """
-    Represents a content replacement operation.
-    Used to replace a specific content with a replacement in a state dict key.
+    """Replace ``content`` with ``replacement`` in a state dict key.
+
+    When ``prefix_only`` is True, only keys that *start with* ``content`` are rewritten (prefix swap), avoiding
+    accidental matches inside longer keys (for example ``model.language_model.*`` vs. the substring ``language_model.``).
     """
 
     content: str
     replacement: str
+    prefix_only: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -66,10 +68,10 @@ class SDOps:
     ] = ()  # Immutable tuple of (key, value) pairs
     allowed_keys: frozenset[str] | None = None
 
-    def with_replacement(self, content: str, replacement: str) -> "SDOps":
+    def with_replacement(self, content: str, replacement: str, *, prefix_only: bool = False) -> "SDOps":
         """Create a new SDOps instance with the specified replacement added to the mapping."""
 
-        new_mapping = (*self.mapping, ContentReplacement(content, replacement))
+        new_mapping = (*self.mapping, ContentReplacement(content, replacement, prefix_only))
         return replace(self, mapping=new_mapping)
 
     def with_matching(self, prefix: str = "", suffix: str = "") -> "SDOps":
@@ -107,7 +109,10 @@ class SDOps:
         for replacement in self.mapping:
             if not isinstance(replacement, ContentReplacement):
                 continue
-            if replacement.content in key:
+            if replacement.prefix_only:
+                if key.startswith(replacement.content):
+                    key = replacement.replacement + key[len(replacement.content) :]
+            elif replacement.content in key:
                 key = key.replace(replacement.content, replacement.replacement)
 
         if self.allowed_keys is not None and key not in self.allowed_keys:
