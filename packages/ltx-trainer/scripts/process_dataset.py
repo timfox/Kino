@@ -17,7 +17,13 @@ from pathlib import Path
 import typer
 from decode_latents import LatentsDecoder
 from process_captions import compute_captions_embeddings
-from process_videos import compute_latents, compute_scaled_resolution_buckets, parse_resolution_buckets
+from process_videos import (
+    _ALLOWED_HDR_TRANSFER,
+    _parse_latent_save_dtype,
+    compute_latents,
+    compute_scaled_resolution_buckets,
+    parse_resolution_buckets,
+)
 from rich.console import Console
 
 from ltx_trainer import logger
@@ -52,10 +58,27 @@ def preprocess_dataset(  # noqa: PLR0913
     with_audio: bool = False,
     load_text_encoder_in_8bit: bool = False,
     flat_dim_bridge_rank: int | None = None,
+    hdr_ingest: bool = False,
+    hdr_transfer: str = "auto",
+    hdr_synth_bracket_ev: str | None = None,
+    latent_save_dtype: str = "float32",
 ) -> None:
     """Run the preprocessing pipeline with the given arguments."""
     # Validate dataset file
     _validate_dataset_file(dataset_file)
+
+    ht = hdr_transfer.lower().strip()
+    if ht not in _ALLOWED_HDR_TRANSFER:
+        raise ValueError(
+            f"Unknown hdr_transfer {hdr_transfer!r}; expected one of: {', '.join(sorted(_ALLOWED_HDR_TRANSFER))}"
+        )
+    try:
+        latent_dtype = _parse_latent_save_dtype(latent_save_dtype)
+    except typer.BadParameter as exc:
+        raise ValueError(str(exc)) from exc
+
+    if hdr_synth_bracket_ev and not hdr_ingest:
+        raise ValueError("hdr_synth_bracket_ev requires hdr_ingest=True")
 
     # Set up output directories
     output_base = Path(output_dir) if output_dir else Path(dataset_file).parent / ".precomputed"
@@ -100,6 +123,10 @@ def preprocess_dataset(  # noqa: PLR0913
             vae_tiling=vae_tiling,
             with_audio=with_audio,
             audio_output_dir=str(audio_latents_dir) if audio_latents_dir else None,
+            hdr_ingest=hdr_ingest,
+            hdr_transfer=ht,
+            hdr_synth_bracket_ev=hdr_synth_bracket_ev,
+            latent_save_dtype=latent_dtype,
         )
 
         # Process reference videos if reference_column is provided
@@ -136,6 +163,10 @@ def preprocess_dataset(  # noqa: PLR0913
                 batch_size=batch_size,
                 device=device,
                 vae_tiling=vae_tiling,
+                hdr_ingest=hdr_ingest,
+                hdr_transfer=ht,
+                hdr_synth_bracket_ev=hdr_synth_bracket_ev,
+                latent_save_dtype=latent_dtype,
             )
 
     # Handle decoding if requested (for verification)
@@ -260,6 +291,22 @@ def main(  # noqa: PLR0913
         help="Downscale factor for reference video resolution. When > 1, reference videos are processed at "
         "1/n resolution (e.g., 2 means half resolution). Used for efficient IC-LoRA training.",
     ),
+    hdr_ingest: bool = typer.Option(
+        default=False,
+        help="HDR decode to scene-linear float32; save hdr_latent per clip; tone-map for VAE input",
+    ),
+    hdr_transfer: str = typer.Option(
+        default="auto",
+        help="Color transfer for HDR linearization: auto, pq, hlg, srgb, or linear",
+    ),
+    latent_save_dtype: str = typer.Option(
+        default="float32",
+        help="Torch dtype for saved VAE latents on disk: float32, bfloat16, or float16",
+    ),
+    hdr_synth_bracket_ev: str | None = typer.Option(
+        default=None,
+        help='LatentHDR-style synthetic γ-LDR stack spec "ev_min:ev_max:step" (e.g. "-7:5:1"); requires --hdr-ingest',
+    ),
 ) -> None:
     """Preprocess a video dataset by computing and saving latents and text embeddings.
     The dataset must be a CSV, JSON, or JSONL file with columns for captions and video paths.
@@ -300,6 +347,9 @@ def main(  # noqa: PLR0913
     if reference_downscale_factor > 1 and not reference_column:
         logger.warning("--reference-downscale-factor specified but no --reference-column provided. Ignoring.")
 
+    if hdr_synth_bracket_ev and not hdr_ingest:
+        raise typer.BadParameter("--hdr-synth-bracket-ev requires --hdr-ingest")
+
     preprocess_dataset(
         dataset_file=dataset_path,
         caption_column=caption_column,
@@ -319,6 +369,10 @@ def main(  # noqa: PLR0913
         with_audio=with_audio,
         load_text_encoder_in_8bit=load_text_encoder_in_8bit,
         flat_dim_bridge_rank=flat_dim_bridge_rank,
+        hdr_ingest=hdr_ingest,
+        hdr_transfer=hdr_transfer,
+        hdr_synth_bracket_ev=hdr_synth_bracket_ev,
+        latent_save_dtype=latent_save_dtype,
     )
 
 

@@ -43,6 +43,16 @@ from transformers.utils.logging import disable_progress_bar
 from ltx_core.model.audio_vae import AudioProcessor
 from ltx_core.types import Audio
 from ltx_trainer import logger
+from ltx_trainer.hdr_ingest import (
+    ev_list_arange,
+    hdr_meta_dict_to_padded_u8,
+    latenthdr_meta_block,
+    padded_u8_to_hdr_meta_dict,
+    parse_ev_bracket_spec,
+    read_video_hdr_float32,
+    reinhard_tonemap,
+    synthetic_gamma_ldr_stack_from_linear_hdr,
+)
 from ltx_trainer.model_loader import load_audio_vae_encoder, load_video_vae_encoder
 from ltx_trainer.utils import open_image_as_srgb
 from ltx_trainer.video_utils import get_video_frame_count, read_video
@@ -124,6 +134,9 @@ class MediaDataset(Dataset):
         resolution_buckets: list[tuple[int, int, int]],
         reshape_mode: str = "center",
         with_audio: bool = False,
+        hdr_ingest: bool = False,
+        hdr_transfer: str = "auto",
+        hdr_synth_bracket_ev: str | None = None,
     ) -> None:
         """
         Initialize the media dataset.
@@ -133,6 +146,12 @@ class MediaDataset(Dataset):
             resolution_buckets: List of (frames, height, width) tuples
             reshape_mode: How to crop videos ("center", "random")
             with_audio: Whether to extract audio from video files
+            hdr_ingest: If True, decode video to scene-linear float32, store ``hdr_latent`` when
+                computing latents, and tone-map for VAE input.
+            hdr_transfer: Color transfer for HDR linearization when ``hdr_ingest`` is True
+                (``auto`` inspects the bitstream; ``pq`` / ``hlg`` / ``srgb`` / ``linear`` override).
+            hdr_synth_bracket_ev: If set (e.g. ``"-7:5:1"``), save a LatentHDR-style γ-encoded synthetic
+                LDR stack ``hdr_ldr_ev_stack`` ``[N,C,F,H,W]`` alongside ``hdr_latent`` (requires ``hdr_ingest``).
         """
         super().__init__()
 
@@ -141,6 +160,9 @@ class MediaDataset(Dataset):
         self.resolution_buckets = resolution_buckets
         self.reshape_mode = reshape_mode
         self.with_audio = with_audio
+        self.hdr_ingest = hdr_ingest
+        self.hdr_transfer = hdr_transfer
+        self.hdr_synth_bracket_ev = hdr_synth_bracket_ev
 
         # First load main media paths (resolved on disk) and manifest-relative keys for output layout
         self.main_media_paths, self.main_media_relpaths = self._load_video_paths_with_relpaths(main_media_column)
@@ -179,8 +201,11 @@ class MediaDataset(Dataset):
             media_tensor = self._preprocess_image(video_path)
             fps = 1.0
             audio_data = None  # Images don't have audio
+            hdr_latent = None
+            hdr_meta_u8 = None
+            hdr_ldr_ev_stack = None
         else:
-            media_tensor, fps = self._preprocess_video(video_path)
+            media_tensor, fps, hdr_latent, hdr_meta_u8, hdr_ldr_ev_stack = self._preprocess_video(video_path)
 
             # Extract audio if enabled
             if self.with_audio:
@@ -206,6 +231,12 @@ class MediaDataset(Dataset):
                 "fps": fps,
             },
         }
+
+        if hdr_latent is not None and hdr_meta_u8 is not None:
+            result["hdr_latent"] = hdr_latent
+            result["hdr_meta_u8"] = hdr_meta_u8
+            if hdr_ldr_ev_stack is not None:
+                result["hdr_ldr_ev_stack"] = hdr_ldr_ev_stack
 
         # Add audio data if available
         if audio_data is not None:
@@ -373,11 +404,45 @@ class MediaDataset(Dataset):
         image = image.unsqueeze(1)
         return image
 
-    def _preprocess_video(self, path: Path) -> tuple[torch.Tensor, float]:
+    def _preprocess_video(
+        self, path: Path
+    ) -> tuple[torch.Tensor, float, torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]:
         """Preprocess a video by loading, resizing, and applying transforms.
         Returns:
-            Tuple of (video tensor in [C, F, H, W] format, fps)
+            Tuple of (VAE input ``[C,F,H,W]``, fps, optional ``hdr_latent``, optional ``hdr_meta_u8``,
+            optional ``hdr_ldr_ev_stack`` ``[N,C,F,H,W]`` γ-encoded synthetic LDRs when configured).
         """
+        if self.hdr_ingest:
+            video_linear, fps, hdr_meta = read_video_hdr_float32(
+                path, max_frames=self.max_target_frames, hdr_transfer=self.hdr_transfer
+            )
+            nearest_bucket = self._get_resolution_bucket_for_item(video_linear)
+            target_num_frames, target_height, target_width = nearest_bucket
+            frames_linear = self._resize_and_crop(video_linear, target_height, target_width)
+            frames_linear = frames_linear[:target_num_frames]
+            hdr_latent = frames_linear.permute(1, 0, 2, 3).contiguous().to(torch.float32)
+
+            tonemapped = reinhard_tonemap(frames_linear)
+            video = torch.stack([self.transforms(frame) for frame in tonemapped], dim=0)
+            video = video.permute(1, 0, 2, 3).contiguous()
+
+            ld_stack: torch.Tensor | None = None
+            hdr_meta = {**hdr_meta, **latenthdr_meta_block(save_ldr_stack=bool(self.hdr_synth_bracket_ev))}
+            if self.hdr_synth_bracket_ev:
+                emin, emax, estep = parse_ev_bracket_spec(self.hdr_synth_bracket_ev)
+                ld_stack, evs = synthetic_gamma_ldr_stack_from_linear_hdr(hdr_latent, emin, emax, estep)
+                hdr_meta["latenthdr"]["synthetic_bracket_recipe"] = {
+                    "ev_min": emin,
+                    "ev_max": emax,
+                    "ev_step": estep,
+                    "gamma": 2.2,
+                }
+                hdr_meta["latenthdr"]["ev_list"] = evs
+                hdr_meta["latenthdr"]["ev_spec_saved"] = self.hdr_synth_bracket_ev
+
+            meta_u8 = hdr_meta_dict_to_padded_u8(hdr_meta)
+            return video, fps, hdr_latent, meta_u8, ld_stack
+
         # Load video frames up to max_target_frames
         video, fps = read_video(path, max_frames=self.max_target_frames)
 
@@ -395,7 +460,7 @@ class MediaDataset(Dataset):
         # After DataLoader batching, this becomes [B,C,F,H,W] which VAE expects
         video = video.permute(1, 0, 2, 3).contiguous()
 
-        return video, fps
+        return video, fps, None, None, None
 
     def _get_resolution_bucket_for_item(self, media_tensor: torch.Tensor) -> tuple[int, int, int]:
         """Get the nearest resolution bucket for the given media tensor."""
@@ -487,6 +552,10 @@ def compute_latents(  # noqa: PLR0913, PLR0915
     vae_tiling: bool = False,
     with_audio: bool = False,
     audio_output_dir: str | None = None,
+    hdr_ingest: bool = False,
+    hdr_transfer: str = "auto",
+    hdr_synth_bracket_ev: str | None = None,
+    latent_save_dtype: torch.dtype = torch.float32,
 ) -> None:
     """
     Process videos and save latent representations.
@@ -503,10 +572,23 @@ def compute_latents(  # noqa: PLR0913, PLR0915
         vae_tiling: Whether to enable VAE tiling
         with_audio: Whether to extract and encode audio from videos
         audio_output_dir: Directory to save audio latents (required if with_audio=True)
+        hdr_ingest: Decode to scene-linear float32, save ``hdr_latent`` in each ``.pt``, tone-map for VAE
+        hdr_transfer: ``auto``, ``pq``, ``hlg``, ``srgb``, or ``linear`` (see ``ltx_trainer.hdr_ingest``)
+        hdr_synth_bracket_ev: Optional ``"ev_min:ev_max:step"`` (e.g. ``"-7:5:1"``) to save ``hdr_ldr_ev_stack``
+            (LatentHDR Appendix A synthetic γ-LDR stack). Requires ``hdr_ingest=True``.
+        latent_save_dtype: Dtype for stored VAE ``latents`` tensors (default float32)
     """
     # Validate audio parameters
     if with_audio and audio_output_dir is None:
         raise ValueError("audio_output_dir must be provided when with_audio=True")
+
+    if hdr_synth_bracket_ev and not hdr_ingest:
+        raise ValueError("hdr_synth_bracket_ev requires hdr_ingest=True")
+
+    _ev_list_for_save: list[float] | None = None
+    if hdr_synth_bracket_ev:
+        emin, emax, estep = parse_ev_bracket_spec(hdr_synth_bracket_ev)
+        _ev_list_for_save = ev_list_arange(emin, emax, estep)
 
     console = Console()
     torch_device = torch.device(device)
@@ -519,8 +601,21 @@ def compute_latents(  # noqa: PLR0913, PLR0915
         resolution_buckets=resolution_buckets,
         reshape_mode=reshape_mode,
         with_audio=with_audio,
+        hdr_ingest=hdr_ingest,
+        hdr_transfer=hdr_transfer,
+        hdr_synth_bracket_ev=hdr_synth_bracket_ev,
     )
     logger.info(f"Loaded {len(dataset)} valid media files")
+
+    if hdr_ingest:
+        logger.info(
+            "HDR ingest enabled: scene-linear float32 ``hdr_latent`` in each .pt; VAE input uses Reinhard tone-map. "
+            "Stored ``latents`` are LTX VAE encoder outputs (posterior mean / normalized), matching LatentHDR-style μ supervision."
+        )
+        if hdr_synth_bracket_ev:
+            logger.info(
+                f"Synthetic γ-encoded LDR EV stack enabled ({hdr_synth_bracket_ev}); see ``hdr_ldr_ev_stack`` in each .pt."
+            )
 
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
@@ -584,7 +679,12 @@ def compute_latents(  # noqa: PLR0913, PLR0915
 
             # Encode video
             with torch.inference_mode():
-                video_latent_data = encode_video(vae=vae, video=video, use_tiling=vae_tiling)
+                video_latent_data = encode_video(
+                    vae=vae,
+                    video=video,
+                    use_tiling=vae_tiling,
+                    dtype=latent_save_dtype,
+                )
 
             # Save latents for each item in batch
             for i in range(len(batch["relative_path"])):
@@ -595,13 +695,21 @@ def compute_latents(  # noqa: PLR0913, PLR0915
                 output_file.parent.mkdir(parents=True, exist_ok=True)
 
                 # Index into batch to get this item's latents
-                latent_data = {
-                    "latents": video_latent_data["latents"][i].cpu().contiguous(),  # [C, F', H', W']
+                latent_data: dict[str, Any] = {
+                    "latents": video_latent_data["latents"][i].cpu().contiguous(),
                     "num_frames": video_latent_data["num_frames"],
                     "height": video_latent_data["height"],
                     "width": video_latent_data["width"],
                     "fps": batch["video_metadata"]["fps"][i].item(),
+                    "latent_save_dtype": str(latent_save_dtype).replace("torch.", ""),
                 }
+
+                if batch.get("hdr_latent") is not None and batch.get("hdr_meta_u8") is not None:
+                    latent_data["hdr_latent"] = batch["hdr_latent"][i].cpu().contiguous()
+                    latent_data["hdr_meta"] = padded_u8_to_hdr_meta_dict(batch["hdr_meta_u8"][i].cpu())
+                    if batch.get("hdr_ldr_ev_stack") is not None and _ev_list_for_save is not None:
+                        latent_data["hdr_ldr_ev_stack"] = batch["hdr_ldr_ev_stack"][i].cpu().contiguous()
+                        latent_data["hdr_ev_list"] = _ev_list_for_save
 
                 torch.save(latent_data, output_file)
 
@@ -978,6 +1086,19 @@ def compute_scaled_resolution_buckets(
     return scaled_buckets
 
 
+_ALLOWED_HDR_TRANSFER = frozenset({"auto", "pq", "hlg", "srgb", "linear"})
+
+
+def _parse_latent_save_dtype(name: str) -> torch.dtype:
+    key = name.lower().strip()
+    mapping = {"float32": torch.float32, "bfloat16": torch.bfloat16, "float16": torch.float16}
+    if key not in mapping:
+        raise typer.BadParameter(
+            f"Unknown latent save dtype {name!r}; expected one of: {', '.join(sorted(mapping))}"
+        )
+    return mapping[key]
+
+
 @app.command()
 def main(  # noqa: PLR0913
     dataset_file: str = typer.Argument(
@@ -1024,6 +1145,22 @@ def main(  # noqa: PLR0913
         default=None,
         help="Output directory for audio latents (required if --with-audio is set)",
     ),
+    hdr_ingest: bool = typer.Option(
+        default=False,
+        help="HDR decode to scene-linear float32; save hdr_latent in each .pt; tone-map for VAE input",
+    ),
+    hdr_transfer: str = typer.Option(
+        default="auto",
+        help="Color transfer for HDR linearization: auto, pq, hlg, srgb, or linear",
+    ),
+    latent_save_dtype: str = typer.Option(
+        default="float32",
+        help="Torch dtype for saved VAE latents on disk: float32, bfloat16, or float16",
+    ),
+    hdr_synth_bracket_ev: str | None = typer.Option(
+        default=None,
+        help='Optional LatentHDR-style synthetic γ-LDR stack: "ev_min:ev_max:step" (e.g. "-7:5:1"); requires --hdr-ingest',
+    ),
 ) -> None:
     """Process videos/images and save latent representations for video generation training.
     This script processes videos and images from metadata files and saves latent representations
@@ -1056,6 +1193,17 @@ def main(  # noqa: PLR0913
     # Parse resolution buckets
     parsed_resolution_buckets = parse_resolution_buckets(resolution_buckets)
 
+    ht = hdr_transfer.lower().strip()
+    if ht not in _ALLOWED_HDR_TRANSFER:
+        raise typer.BadParameter(
+            f"Unknown hdr-transfer {hdr_transfer!r}; expected one of: {', '.join(sorted(_ALLOWED_HDR_TRANSFER))}"
+        )
+
+    if hdr_synth_bracket_ev and not hdr_ingest:
+        raise typer.BadParameter('--hdr-synth-bracket-ev requires --hdr-ingest')
+
+    latent_dtype = _parse_latent_save_dtype(latent_save_dtype)
+
     if len(parsed_resolution_buckets) > 1:
         logger.warning(
             "Using multiple resolution buckets. "
@@ -1075,6 +1223,10 @@ def main(  # noqa: PLR0913
         vae_tiling=vae_tiling,
         with_audio=with_audio,
         audio_output_dir=audio_output_dir,
+        hdr_ingest=hdr_ingest,
+        hdr_transfer=ht,
+        hdr_synth_bracket_ev=hdr_synth_bracket_ev,
+        latent_save_dtype=latent_dtype,
     )
 
 
