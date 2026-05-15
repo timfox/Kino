@@ -1,4 +1,4 @@
-"""HDR-oriented video decode: float32 tensors and HDR research helpers (LatentHDR, X2HDR).
+"""HDR-oriented video/still decode: float32 tensors and HDR research helpers (LatentHDR, X2HDR).
 
 Decodes frames to **scene-linear** RGB float32 (relative intensity; PQ/HLG paths follow
 ITU-R BT.2100-style formulas). Intended for auxiliary ``hdr_latent`` storage alongside
@@ -307,8 +307,13 @@ def _color_trc_name(stream: Any) -> str:
 
 
 def _resolve_transfer_mode(stream: Any, hdr_transfer: str) -> str:
-    if hdr_transfer != "auto":
-        return hdr_transfer
+    ht = hdr_transfer.strip().lower()
+    if ht != "auto":
+        if ht not in ("pq", "hlg", "srgb", "linear"):
+            raise ValueError(
+                f"Unknown hdr_transfer {hdr_transfer!r}; expected auto, pq, hlg, srgb, or linear"
+            )
+        return ht
     name = _color_trc_name(stream)
     if "2084" in name or "smpte2084" in name:
         return "pq"
@@ -341,6 +346,41 @@ def _to_scene_linear(rgb01: Tensor, transfer_mode: str) -> Tensor:
     return srgb_to_linear(rgb01.clamp(0.0, 1.0))
 
 
+def image_rgb01_chw_to_scene_linear_fchw(
+    rgb01_chw: Tensor,
+    *,
+    hdr_transfer: str = "auto",
+) -> tuple[Tensor, dict[str, Any]]:
+    """Convert one loaded image in display/code space to scene-linear ``[1, 3, H, W]``.
+
+    ``rgb01_chw`` is float ``[3, H, W]`` in ``[0, 1]`` (typical ``to_tensor`` after ``open_image_as_srgb``).
+    Returns ``(linear_fchw, hdr_meta)`` where ``linear_fchw`` is float32 scene-linear and ``hdr_meta``
+    matches the keys produced by :func:`read_video_hdr_float32` so the same JSON merge / pack path applies.
+
+    Stills have no container color metadata; ``hdr_transfer="auto"`` resolves to ``"srgb"``. Use
+    ``"pq"`` / ``"hlg"`` / ``"linear"`` when file values are known to follow that transfer.
+    """
+    if rgb01_chw.ndim != 3 or rgb01_chw.shape[0] != 3:
+        raise ValueError(f"Expected rgb01_chw [3,H,W], got {tuple(rgb01_chw.shape)}")
+    ht = hdr_transfer.strip().lower()
+    if ht == "auto":
+        resolved = "srgb"
+    elif ht in ("pq", "hlg", "srgb", "linear"):
+        resolved = ht
+    else:
+        raise ValueError(f"Unsupported hdr_transfer for stills: {hdr_transfer!r}")
+    meta: dict[str, Any] = {
+        "hdr_transfer_requested": hdr_transfer,
+        "hdr_transfer_resolved": resolved,
+        "color_trc": resolved,
+        "color_primaries": "unknown",
+        "color_space": "unknown",
+        "still_image_ingest": True,
+    }
+    lin = _to_scene_linear(rgb01_chw.detach().float(), resolved)
+    return lin.unsqueeze(0), meta
+
+
 def read_video_hdr_float32(
     video_path: str | Path,
     max_frames: int | None = None,
@@ -357,6 +397,11 @@ def read_video_hdr_float32(
         ``(frames, fps, meta)`` where ``frames`` is ``[F, C, H, W]`` float32, ``meta`` includes
         color hints and the resolved transfer used for linearization.
     """
+    ht_req = hdr_transfer.strip().lower()
+    if ht_req not in ("auto", "pq", "hlg", "srgb", "linear"):
+        raise ValueError(
+            f"Unknown hdr_transfer {hdr_transfer!r}; expected auto, pq, hlg, srgb, or linear"
+        )
     path = Path(video_path)
     with av.open(str(path)) as container:
         vstream = container.streams.video[0]
