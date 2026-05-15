@@ -19,6 +19,7 @@ from decode_latents import LatentsDecoder
 from process_captions import compute_captions_embeddings
 from process_videos import (
     _ALLOWED_HDR_TRANSFER,
+    _ALLOWED_HDR_VAE_ENCODING,
     _parse_latent_save_dtype,
     compute_latents,
     compute_scaled_resolution_buckets,
@@ -61,6 +62,7 @@ def preprocess_dataset(  # noqa: PLR0913
     hdr_ingest: bool = False,
     hdr_transfer: str = "auto",
     hdr_synth_bracket_ev: str | None = None,
+    hdr_vae_encoding: str = "reinhard",
     latent_save_dtype: str = "float32",
 ) -> None:
     """Run the preprocessing pipeline with the given arguments."""
@@ -79,6 +81,17 @@ def preprocess_dataset(  # noqa: PLR0913
 
     if hdr_synth_bracket_ev and not hdr_ingest:
         raise ValueError("hdr_synth_bracket_ev requires hdr_ingest=True")
+
+    hve = hdr_vae_encoding.lower().strip()
+    if hve not in _ALLOWED_HDR_VAE_ENCODING:
+        raise ValueError(
+            f"Unknown hdr_vae_encoding {hdr_vae_encoding!r}; expected one of: "
+            f"{', '.join(sorted(_ALLOWED_HDR_VAE_ENCODING))}"
+        )
+    if hve != "reinhard" and not hdr_ingest:
+        raise ValueError(
+            "hdr_vae_encoding other than 'reinhard' requires hdr_ingest=True (pu21, logc3, or lf_log1p with HDR ingest)"
+        )
 
     # Set up output directories
     output_base = Path(output_dir) if output_dir else Path(dataset_file).parent / ".precomputed"
@@ -126,6 +139,7 @@ def preprocess_dataset(  # noqa: PLR0913
             hdr_ingest=hdr_ingest,
             hdr_transfer=ht,
             hdr_synth_bracket_ev=hdr_synth_bracket_ev,
+            hdr_vae_encoding=hve,
             latent_save_dtype=latent_dtype,
         )
 
@@ -166,6 +180,7 @@ def preprocess_dataset(  # noqa: PLR0913
                 hdr_ingest=hdr_ingest,
                 hdr_transfer=ht,
                 hdr_synth_bracket_ev=hdr_synth_bracket_ev,
+                hdr_vae_encoding=hve,
                 latent_save_dtype=latent_dtype,
             )
 
@@ -307,6 +322,10 @@ def main(  # noqa: PLR0913
         default=None,
         help='LatentHDR-style synthetic γ-LDR stack spec "ev_min:ev_max:step" (e.g. "-7:5:1"); requires --hdr-ingest',
     ),
+    hdr_vae_encoding: str = typer.Option(
+        default="reinhard",
+        help="With --hdr-ingest: VAE pixel encoding: reinhard | pu21 | logc3 | lf_log1p (LF-Diff log tonemap μ=5000)",
+    ),
 ) -> None:
     """Preprocess a video dataset by computing and saving latents and text embeddings.
     The dataset must be a CSV, JSON, or JSONL file with columns for captions and video paths.
@@ -350,6 +369,15 @@ def main(  # noqa: PLR0913
     if hdr_synth_bracket_ev and not hdr_ingest:
         raise typer.BadParameter("--hdr-synth-bracket-ev requires --hdr-ingest")
 
+    hve = hdr_vae_encoding.lower().strip()
+    if hve not in _ALLOWED_HDR_VAE_ENCODING:
+        raise typer.BadParameter(
+            f"Unknown --hdr-vae-encoding {hdr_vae_encoding!r}; expected one of: "
+            f"{', '.join(sorted(_ALLOWED_HDR_VAE_ENCODING))}"
+        )
+    if hve != "reinhard" and not hdr_ingest:
+        raise typer.BadParameter("--hdr-vae-encoding pu21, logc3, or lf_log1p requires --hdr-ingest")
+
     preprocess_dataset(
         dataset_file=dataset_path,
         caption_column=caption_column,
@@ -372,6 +400,7 @@ def main(  # noqa: PLR0913
         hdr_ingest=hdr_ingest,
         hdr_transfer=hdr_transfer,
         hdr_synth_bracket_ev=hdr_synth_bracket_ev,
+        hdr_vae_encoding=hve,
         latent_save_dtype=latent_save_dtype,
     )
 

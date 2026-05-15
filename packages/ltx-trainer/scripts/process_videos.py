@@ -47,11 +47,17 @@ from ltx_trainer.hdr_ingest import (
     ev_list_arange,
     hdr_meta_dict_to_padded_u8,
     latenthdr_meta_block,
+    lf_diff_meta_block,
+    linear_scene_to_lf_diff_tonemap_display,
+    linear_scene_to_logc3_display,
+    linear_scene_to_pu21_display,
+    lumivid_meta_block,
     padded_u8_to_hdr_meta_dict,
     parse_ev_bracket_spec,
     read_video_hdr_float32,
     reinhard_tonemap,
     synthetic_gamma_ldr_stack_from_linear_hdr,
+    x2hdr_meta_block,
 )
 from ltx_trainer.model_loader import load_audio_vae_encoder, load_video_vae_encoder
 from ltx_trainer.utils import open_image_as_srgb
@@ -137,6 +143,7 @@ class MediaDataset(Dataset):
         hdr_ingest: bool = False,
         hdr_transfer: str = "auto",
         hdr_synth_bracket_ev: str | None = None,
+        hdr_vae_encoding: str = "reinhard",
     ) -> None:
         """
         Initialize the media dataset.
@@ -152,6 +159,10 @@ class MediaDataset(Dataset):
                 (``auto`` inspects the bitstream; ``pq`` / ``hlg`` / ``srgb`` / ``linear`` override).
             hdr_synth_bracket_ev: If set (e.g. ``"-7:5:1"``), save a LatentHDR-style γ-encoded synthetic
                 LDR stack ``hdr_ldr_ev_stack`` ``[N,C,F,H,W]`` alongside ``hdr_latent`` (requires ``hdr_ingest``).
+            hdr_vae_encoding: When ``hdr_ingest`` is True, how to map scene-linear frames to ``[0,1]`` before the
+                VAE's ``[-1,1]`` normalize: ``reinhard`` (default), ``pu21`` (X2HDR, peak→4000 cd/m² then PU21),
+                ``logc3`` (LumiVid / arXiv:2604.11788 — ARRI LogC3 via ``ltx_core.hdr.LogC3``, no peak rescale), or
+                ``lf_log1p`` (LF-Diff / arXiv:2404.00849 — ``log(1+μ x)/log(1+μ)``, ``μ=5000``).
         """
         super().__init__()
 
@@ -163,6 +174,13 @@ class MediaDataset(Dataset):
         self.hdr_ingest = hdr_ingest
         self.hdr_transfer = hdr_transfer
         self.hdr_synth_bracket_ev = hdr_synth_bracket_ev
+        hve = hdr_vae_encoding.lower().strip()
+        if hve not in _ALLOWED_HDR_VAE_ENCODING:
+            raise ValueError(
+                f"Unknown hdr_vae_encoding {hdr_vae_encoding!r}; expected one of: "
+                f"{', '.join(sorted(_ALLOWED_HDR_VAE_ENCODING))}"
+            )
+        self.hdr_vae_encoding = hve
 
         # First load main media paths (resolved on disk) and manifest-relative keys for output layout
         self.main_media_paths, self.main_media_relpaths = self._load_video_paths_with_relpaths(main_media_column)
@@ -422,12 +440,26 @@ class MediaDataset(Dataset):
             frames_linear = frames_linear[:target_num_frames]
             hdr_latent = frames_linear.permute(1, 0, 2, 3).contiguous().to(torch.float32)
 
-            tonemapped = reinhard_tonemap(frames_linear)
+            if self.hdr_vae_encoding == "pu21":
+                tonemapped = linear_scene_to_pu21_display(frames_linear)
+            elif self.hdr_vae_encoding == "logc3":
+                tonemapped = linear_scene_to_logc3_display(frames_linear)
+            elif self.hdr_vae_encoding == "lf_log1p":
+                tonemapped = linear_scene_to_lf_diff_tonemap_display(frames_linear)
+            else:
+                tonemapped = reinhard_tonemap(frames_linear)
             video = torch.stack([self.transforms(frame) for frame in tonemapped], dim=0)
             video = video.permute(1, 0, 2, 3).contiguous()
 
             ld_stack: torch.Tensor | None = None
             hdr_meta = {**hdr_meta, **latenthdr_meta_block(save_ldr_stack=bool(self.hdr_synth_bracket_ev))}
+            if self.hdr_vae_encoding == "pu21":
+                hdr_meta = {**hdr_meta, **x2hdr_meta_block(vae_encoding="pu21")}
+            elif self.hdr_vae_encoding == "logc3":
+                hdr_meta = {**hdr_meta, **lumivid_meta_block(vae_encoding="logc3")}
+            elif self.hdr_vae_encoding == "lf_log1p":
+                hdr_meta = {**hdr_meta, **lf_diff_meta_block()}
+            hdr_meta["hdr_vae_encoding"] = self.hdr_vae_encoding
             if self.hdr_synth_bracket_ev:
                 emin, emax, estep = parse_ev_bracket_spec(self.hdr_synth_bracket_ev)
                 ld_stack, evs = synthetic_gamma_ldr_stack_from_linear_hdr(hdr_latent, emin, emax, estep)
@@ -555,6 +587,7 @@ def compute_latents(  # noqa: PLR0913, PLR0915
     hdr_ingest: bool = False,
     hdr_transfer: str = "auto",
     hdr_synth_bracket_ev: str | None = None,
+    hdr_vae_encoding: str = "reinhard",
     latent_save_dtype: torch.dtype = torch.float32,
 ) -> None:
     """
@@ -576,6 +609,8 @@ def compute_latents(  # noqa: PLR0913, PLR0915
         hdr_transfer: ``auto``, ``pq``, ``hlg``, ``srgb``, or ``linear`` (see ``ltx_trainer.hdr_ingest``)
         hdr_synth_bracket_ev: Optional ``"ev_min:ev_max:step"`` (e.g. ``"-7:5:1"``) to save ``hdr_ldr_ev_stack``
             (LatentHDR Appendix A synthetic γ-LDR stack). Requires ``hdr_ingest=True``.
+        hdr_vae_encoding: ``reinhard`` (default), ``pu21`` (X2HDR), ``logc3`` (LumiVid), or ``lf_log1p`` (LF-Diff tonemap).
+            Requires ``hdr_ingest=True`` when not ``reinhard``.
         latent_save_dtype: Dtype for stored VAE ``latents`` tensors (default float32)
     """
     # Validate audio parameters
@@ -584,6 +619,15 @@ def compute_latents(  # noqa: PLR0913, PLR0915
 
     if hdr_synth_bracket_ev and not hdr_ingest:
         raise ValueError("hdr_synth_bracket_ev requires hdr_ingest=True")
+
+    hve = hdr_vae_encoding.lower().strip()
+    if hve not in _ALLOWED_HDR_VAE_ENCODING:
+        raise ValueError(
+            f"Unknown hdr_vae_encoding {hdr_vae_encoding!r}; expected one of: "
+            f"{', '.join(sorted(_ALLOWED_HDR_VAE_ENCODING))}"
+        )
+    if hve != "reinhard" and not hdr_ingest:
+        raise ValueError("hdr_vae_encoding other than 'reinhard' requires hdr_ingest=True (pu21, logc3, or lf_log1p)")
 
     _ev_list_for_save: list[float] | None = None
     if hdr_synth_bracket_ev:
@@ -604,14 +648,34 @@ def compute_latents(  # noqa: PLR0913, PLR0915
         hdr_ingest=hdr_ingest,
         hdr_transfer=hdr_transfer,
         hdr_synth_bracket_ev=hdr_synth_bracket_ev,
+        hdr_vae_encoding=hve,
     )
     logger.info(f"Loaded {len(dataset)} valid media files")
 
     if hdr_ingest:
-        logger.info(
-            "HDR ingest enabled: scene-linear float32 ``hdr_latent`` in each .pt; VAE input uses Reinhard tone-map. "
-            "Stored ``latents`` are LTX VAE encoder outputs (posterior mean / normalized), matching LatentHDR-style μ supervision."
-        )
+        if hve == "pu21":
+            logger.info(
+                "HDR ingest enabled: scene-linear float32 ``hdr_latent`` in each .pt; VAE input uses X2HDR PU21 "
+                "(per-clip peak → 4000 cd/m², see ``hdr_meta`` ``x2hdr``). "
+                "Stored ``latents`` are LTX VAE encoder outputs (posterior mean / normalized), matching LatentHDR-style μ supervision."
+            )
+        elif hve == "logc3":
+            logger.info(
+                "HDR ingest enabled: scene-linear float32 ``hdr_latent`` in each .pt; VAE input uses LumiVid LogC3 "
+                "(``ltx_core.hdr.LogC3``, see ``hdr_meta`` ``lumivid``). "
+                "Stored ``latents`` are LTX VAE encoder outputs (posterior mean / normalized), matching LatentHDR-style μ supervision."
+            )
+        elif hve == "lf_log1p":
+            logger.info(
+                "HDR ingest enabled: scene-linear float32 ``hdr_latent`` in each .pt; VAE input uses LF-Diff log tonemap "
+                "(log(1+μ x)/log(1+μ), μ=5000, see ``hdr_meta`` ``lf_diff``). "
+                "Stored ``latents`` are LTX VAE encoder outputs (posterior mean / normalized), matching LatentHDR-style μ supervision."
+            )
+        else:
+            logger.info(
+                "HDR ingest enabled: scene-linear float32 ``hdr_latent`` in each .pt; VAE input uses Reinhard tone-map. "
+                "Stored ``latents`` are LTX VAE encoder outputs (posterior mean / normalized), matching LatentHDR-style μ supervision."
+            )
         if hdr_synth_bracket_ev:
             logger.info(
                 f"Synthetic γ-encoded LDR EV stack enabled ({hdr_synth_bracket_ev}); see ``hdr_ldr_ev_stack`` in each .pt."
@@ -1087,6 +1151,7 @@ def compute_scaled_resolution_buckets(
 
 
 _ALLOWED_HDR_TRANSFER = frozenset({"auto", "pq", "hlg", "srgb", "linear"})
+_ALLOWED_HDR_VAE_ENCODING = frozenset({"reinhard", "pu21", "logc3", "lf_log1p"})
 
 
 def _parse_latent_save_dtype(name: str) -> torch.dtype:
@@ -1161,6 +1226,10 @@ def main(  # noqa: PLR0913
         default=None,
         help='Optional LatentHDR-style synthetic γ-LDR stack: "ev_min:ev_max:step" (e.g. "-7:5:1"); requires --hdr-ingest',
     ),
+    hdr_vae_encoding: str = typer.Option(
+        default="reinhard",
+        help="With --hdr-ingest: VAE pixel encoding: reinhard | pu21 | logc3 | lf_log1p (LF-Diff log tonemap μ=5000)",
+    ),
 ) -> None:
     """Process videos/images and save latent representations for video generation training.
     This script processes videos and images from metadata files and saves latent representations
@@ -1202,6 +1271,15 @@ def main(  # noqa: PLR0913
     if hdr_synth_bracket_ev and not hdr_ingest:
         raise typer.BadParameter('--hdr-synth-bracket-ev requires --hdr-ingest')
 
+    hve = hdr_vae_encoding.lower().strip()
+    if hve not in _ALLOWED_HDR_VAE_ENCODING:
+        raise typer.BadParameter(
+            f"Unknown --hdr-vae-encoding {hdr_vae_encoding!r}; expected one of: "
+            f"{', '.join(sorted(_ALLOWED_HDR_VAE_ENCODING))}"
+        )
+    if hve != "reinhard" and not hdr_ingest:
+        raise typer.BadParameter("--hdr-vae-encoding pu21, logc3, or lf_log1p requires --hdr-ingest")
+
     latent_dtype = _parse_latent_save_dtype(latent_save_dtype)
 
     if len(parsed_resolution_buckets) > 1:
@@ -1226,6 +1304,7 @@ def main(  # noqa: PLR0913
         hdr_ingest=hdr_ingest,
         hdr_transfer=ht,
         hdr_synth_bracket_ev=hdr_synth_bracket_ev,
+        hdr_vae_encoding=hve,
         latent_save_dtype=latent_dtype,
     )
 

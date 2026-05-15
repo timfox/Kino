@@ -1,4 +1,4 @@
-"""HDR-oriented video decode: float32 tensors and LatentHDR-aligned radiometry helpers.
+"""HDR-oriented video decode: float32 tensors and HDR research helpers (LatentHDR, X2HDR).
 
 Decodes frames to **scene-linear** RGB float32 (relative intensity; PQ/HLG paths follow
 ITU-R BT.2100-style formulas). Intended for auxiliary ``hdr_latent`` storage alongside
@@ -17,18 +17,248 @@ VAE latents, not as a replacement for the VAE's trained input domain.
 - **VAE latents as posterior means**: LTX's ``VideoEncoder.forward`` returns normalized
   **means** only (log-var is stripped after ``torch.chunk``), matching LatentHDR's use of
   ``μ(x)`` rather than sampled ``z`` for supervision when variance is negligible.
+
+**Alignment with X2HDR** (arXiv:2602.04814, arXiv perpetual non-exclusive license):
+
+- **Perceptually uniform VAE input**: LDR-pretrained VAEs match statistics better when HDR is
+  encoded in **PU21** (Mantiuk and Azimi, 2021) than in naive linear RGB. Optional
+  ``hdr_vae_encoding="pu21"`` maps scene-linear radiance (after per-clip peak rescale to
+  ``L_peak`` cd/m²) through the paper's log-quadratic PU21 forward, then the usual
+  ``[0,1] → [-1,1]`` normalization for the frozen VAE (Sec. 3--4).
+- **Inverse**: ``pu21_inverse_to_linear_abs`` recovers absolute linear luminance from PU21
+  codes for offline inspection or future decode pipelines (Eq. inverse in Sec. 3.1).
+- **FP32**: X2HDR notes BF16 can band in smooth dark gradients (Appendix D.10); this repo
+  already defaults saved VAE latents to float32 where configured.
+
+**Alignment with LumiVid** (arXiv:2604.11788, CC BY 4.0):
+
+- **Logarithmic / camera-oriented VAE input**: LumiVid argues a fixed **ARRI LogC3** curve aligns
+  scene-linear HDR with the **pixel and latent** statistics of SDR-pretrained video models better than
+  several display-centric transforms, enabling **frozen VAE** + lightweight **LoRA** adaptation.
+- **This repo**: optional ``hdr_vae_encoding="logc3"`` feeds ``linear_scene_to_logc3_display`` into the
+  same ``[0,1] → [-1,1]`` path as other encodings. Inverse for decode / EXR export reuses
+  ``ltx_core.hdr.LogC3.decompress`` (same implementation as ``tools/logc3_numpy.py``).
+- **Training signal** (camera-mimicking degradations on SDR references) is a **trainer** concern; it is
+  not applied in latent preprocessing here—only noted in ``lumivid_meta_block`` for provenance.
+
+**Alignment with LF-Diff** (arXiv:2404.00849, arXiv perpetual non-exclusive license):
+
+- **Compact target for diffusion**: LF-Diff applies the DM to a **small low-frequency prior** (LPR), not
+  to a full HDR image from pure noise, and fuses it with a **regression** HDR head—much cheaper than
+  pixel-space DiffHDR-style sampling. That split is a **trainer / architecture** choice; this repo only
+  documents it in ``lf_diff_meta_block``.
+- **Tonemap used in the paper** for LPENet inputs and reconstruction loss: ``T(x)=log(1+μ x)/log(1+μ)``
+  with ``μ=5000`` (Sec. 4.1). Optional ``hdr_vae_encoding="lf_log1p"`` uses the same ``T`` on
+  non-negative scene-linear frames as a bounded ``[0,1]`` proxy before the usual VAE normalize.
+- **Joint training** (DM + DHRNet) vs split training is noted in metadata; not enforced here.
+- **Reconstruction loss (Eq. 11)**: tonemapped L1 ``||T(H)-T(H_pred)||_1`` plus VGG perceptual term on
+  ``T(H)``; use :func:`lf_diff_tonemap_l1` for the first term when both tensors are non-negative linear HDR.
+- **LPENet stack (Eq. 6)**: :func:`lf_diff_concat_linear_tonemap` builds ``Concat(H, T(H))`` on channels; apply
+  ``torch.nn.PixelUnshuffle`` downstream when training an LPENet-style encoder.
+- **FRM split (Eq. 7–8)**: :func:`lf_diff_feature_split_low_high` separates avg-pooled low frequency from a
+  high-frequency residual (default ``k=4`` like PIM; pass ``k=2`` for FRM-scale pooling in the paper).
+- **Stage-2 prior loss (Eq. 15)**: :func:`lf_diff_lpr_l1` is the ``||z_hat - z||_1`` mean term alongside DM noise MSE.
 """
 
 from __future__ import annotations
 
 import json
+import math
 from pathlib import Path
 from typing import Any
 
 import av
 import numpy as np
 import torch
+import torch.nn.functional as F
+from ltx_core.hdr import LogC3
 from torch import Tensor
+
+
+# X2HDR (arXiv:2602.04814) PU21 log-quadratic encoding constants (Sec. 3.1, Ke et al. 2023 fit).
+_PU21_A = 0.001908
+_PU21_B = 0.0078
+_PU21_LOG2_LMIN = math.log2(0.005)
+X2HDR_DEFAULT_L_PEAK_CD_M2 = 4000.0
+
+
+def pu21_forward_linear_abs(L: Tensor) -> Tensor:
+    """Map absolute linear luminance ``L`` (cd/m² scale, per channel) to PU21 code ``V`` in ``[0, 1]``.
+
+    Uses ``V = a (log2 L - Lmin)^2 + b (log2 L - Lmin)`` with ``L ∈ [0.005, 10000]`` (X2HDR Sec. 3.1).
+    """
+    Lc = L.clamp(0.005, 10000.0)
+    u = torch.log2(Lc) - _PU21_LOG2_LMIN
+    return (_PU21_A * u * u + _PU21_B * u).clamp(0.0, 1.0)
+
+
+def pu21_inverse_to_linear_abs(V: Tensor) -> Tensor:
+    """Inverse PU21: ``V ∈ [0,1]`` → absolute linear ``L`` in ``[0.005, 10000]``."""
+    v = V.clamp(0.0, 1.0)
+    disc = _PU21_B * _PU21_B + 4.0 * _PU21_A * v
+    u = (-_PU21_B + torch.sqrt(disc.clamp(min=0.0))) / (2.0 * _PU21_A)
+    log_l = u + _PU21_LOG2_LMIN
+    return torch.pow(2.0, log_l).clamp(0.005, 10000.0)
+
+
+def linear_scene_to_pu21_display(
+    scene_linear_fchw: Tensor,
+    *,
+    l_peak: float = X2HDR_DEFAULT_L_PEAK_CD_M2,
+) -> Tensor:
+    """X2HDR-style PU21 **display** tensor for a frozen LDR VAE (same shape as ``scene_linear_fchw``).
+
+    Globally rescales positive scene-linear RGB so the tensor maximum maps to ``l_peak`` (paper:
+    4,000 cd/m²), then applies ``f_PU21`` channel-wise. Output is in ``[0, 1]`` for each channel,
+    suitable for the same ``clamp + Normalize(0.5)`` stack as Reinhard-tonemapped SDR proxies.
+    """
+    x = scene_linear_fchw.clamp(min=0.0)
+    peak = x.amax().clamp(min=1e-10)
+    L_abs = x * (l_peak / peak)
+    return pu21_forward_linear_abs(L_abs)
+
+
+def x2hdr_meta_block(*, l_peak: float = X2HDR_DEFAULT_L_PEAK_CD_M2, vae_encoding: str = "pu21") -> dict[str, Any]:
+    """Compact X2HDR provenance for ``hdr_meta`` JSON."""
+    return {
+        "x2hdr": {
+            "arxiv_id": "2602.04814",
+            "vae_input_encoding": vae_encoding,
+            "L_peak_cd_m2": l_peak,
+            "pu21_params": {"a": _PU21_A, "b": _PU21_B, "log2_Lmin": _PU21_LOG2_LMIN},
+        }
+    }
+
+
+_LOGC3 = LogC3()
+
+
+def linear_scene_to_logc3_display(scene_linear_fchw: Tensor) -> Tensor:
+    """LumiVid-style **LogC3** codes in ``[0, 1]`` for frozen SDR VAE input (arXiv:2604.11788, Sec. 3.1).
+
+    Maps non-negative scene-linear RGB with ARRI LogC3 (EI 800 constants in ``ltx_core.hdr.LogC3``).
+    Unlike X2HDR PU21 here, **no per-clip peak rescale** is applied: LogC3 already spans many orders
+    of magnitude in linear light; rescaling would distort relative radiance vs the standard curve.
+    Very bright linear values can **saturate** to LogC3 code 1.0; inverse decompress then cannot recover
+    the original peak (same as ``ltx_core.hdr.LogC3`` semantics).
+    """
+    return _LOGC3.compress(scene_linear_fchw.clamp(min=0.0))
+
+
+def lumivid_meta_block(*, vae_encoding: str = "logc3") -> dict[str, Any]:
+    """LumiVid / latent-alignment provenance for ``hdr_meta`` JSON."""
+    return {
+        "lumivid": {
+            "arxiv_id": "2604.11788",
+            "vae_input_encoding": vae_encoding,
+            "logc3": "ltx_core.hdr.LogC3 (EI 800)",
+            "training_note": "Paper Sec. 3.2: camera-mimicking degradations on SDR reference are separate from this preprocess.",
+        }
+    }
+
+
+# LF-Diff (arXiv:2404.00849) tonemap for LPENet / loss (Sec. 4.1), μ controls highlight compression.
+LF_DIFF_TONEMAP_MU_DEFAULT = 5000.0
+
+
+def lf_diff_tonemap_display(x: Tensor, *, mu: float = LF_DIFF_TONEMAP_MU_DEFAULT) -> Tensor:
+    """LF-Diff operator ``T(x) = log(1 + μ x) / log(1 + μ)`` for ``x ≥ 0``, output in ``[0, 1]``."""
+    xc = x.clamp(min=0.0, max=1e6)
+    return (torch.log1p(mu * xc) / math.log1p(mu)).clamp(0.0, 1.0)
+
+
+def lf_diff_tonemap_inverse_display(y: Tensor, *, mu: float = LF_DIFF_TONEMAP_MU_DEFAULT) -> Tensor:
+    """Inverse of :func:`lf_diff_tonemap_display`: ``[0,1]`` codes back to linear ``x ≥ 0``.
+
+    Note: ``y → 1`` corresponds to large linear ``x`` at fixed ``μ``; saturated codes cannot recover
+    peaks above ``x ≈ 1`` in normalized units (``T(1)=1`` for the paper's ``μ=5000``).
+    """
+    yc = y.clamp(0.0, 1.0)
+    return torch.expm1(yc * math.log1p(mu)) / mu
+
+
+def linear_scene_to_lf_diff_tonemap_display(
+    scene_linear_fchw: Tensor,
+    *,
+    mu: float = LF_DIFF_TONEMAP_MU_DEFAULT,
+) -> Tensor:
+    """Apply LF-Diff ``T`` channel-wise to scene-linear frames for frozen VAE input (same shape)."""
+    return lf_diff_tonemap_display(scene_linear_fchw, mu=mu)
+
+
+def lf_diff_tonemap_l1(hdr: Tensor, hdr_hat: Tensor, *, mu: float = LF_DIFF_TONEMAP_MU_DEFAULT) -> Tensor:
+    """Mean absolute error in LF-Diff tonemapped space (Eq. 11, first term ``||T(H)-T(H_pred)||_1`` as mean).
+
+    Both tensors should be non-negative scene-linear RGB (same shape). This is only the **tonemapped
+    L1** piece; the VGG perceptual term in Eq. 11 is left to the trainer.
+    """
+    return (lf_diff_tonemap_display(hdr, mu=mu) - lf_diff_tonemap_display(hdr_hat, mu=mu)).abs().mean()
+
+
+def lf_diff_concat_linear_tonemap(hdr: Tensor, *, mu: float = LF_DIFF_TONEMAP_MU_DEFAULT) -> Tensor:
+    """LF-Diff LPENet-style channel stack ``Concat(H, T(H))`` (Eq. 6, before ``PixelUnshuffle``).
+
+    ``hdr`` must be non-negative linear RGB: shape ``[C, H, W]`` or ``[F, C, H, W]``. Returns the same
+    spatial layout with ``2 * C`` channels (``torch.cat`` on the channel axis).
+    """
+    t = lf_diff_tonemap_display(hdr, mu=mu)
+    if hdr.ndim == 3:
+        return torch.cat([hdr, t], dim=0)
+    if hdr.ndim == 4:
+        return torch.cat([hdr, t], dim=1)
+    raise ValueError(f"lf_diff_concat_linear_tonemap: expected 3D or 4D tensor, got {hdr.ndim}D shape {tuple(hdr.shape)}")
+
+
+def lf_diff_feature_split_low_high(fmaps: Tensor, k: int = 4) -> tuple[Tensor, Tensor]:
+    """LF-Diff FRM-style low / high split (Eq. 7–8) on spatial feature maps.
+
+    ``fmaps`` is ``[C, H, W]`` or ``[B, C, H, W]``. Returns ``(low_upsampled, high)`` where
+    ``low = AvgPool(f, k)`` and ``high = f - Upsample(low)``. Default ``k=4`` matches PIM in Sec. 5.1;
+    use ``k=2`` for the FRM branch kernel reported there.
+    """
+    if k < 1:
+        raise ValueError("k must be >= 1")
+    batched = fmaps.ndim == 4
+    x = fmaps.unsqueeze(0) if not batched else fmaps
+    low = F.avg_pool2d(x, kernel_size=k, stride=k)
+    low_up = F.interpolate(low, size=x.shape[-2:], mode="bilinear", align_corners=False)
+    high = x - low_up
+    if not batched:
+        return low_up.squeeze(0), high.squeeze(0)
+    return low_up, high
+
+
+def lf_diff_lpr_l1(z_hat: Tensor, z: Tensor) -> Tensor:
+    """Mean L1 between predicted and target LPR (LF-Diff Eq. 15, ``||z_hat - z||_1`` as mean over elements)."""
+    return (z_hat - z).abs().mean()
+
+
+def lf_diff_meta_block(*, mu: float = LF_DIFF_TONEMAP_MU_DEFAULT) -> dict[str, Any]:
+    """LF-Diff provenance for ``hdr_meta`` JSON (tonemap only; LPR/DHRNet are trainer-side)."""
+    return {
+        "lf_diff": {
+            "arxiv_id": "2404.00849",
+            "tonemap_mu": mu,
+            "tonemap": "log(1+mu*x)/log(1+mu)",
+            "paper_impl": {
+                "ddim_T": 200,
+                "ddim_S_train_infer": 10,
+                "L_r_vgg_lambda": 0.01,
+                "lpenet_pixelunshuffle_factor": 4,
+                "L_r_tonemap": "same_T_as_lpenet_eq6",
+                "train_patch_hw": 128,
+                "train_patch_stride": 64,
+                "train_batch_size": 64,
+                "dhrnet_channel_C": 60,
+                "dhrnet_Ni_per_level": [3, 3, 3],
+                "pim_avgpool_k": 4,
+                "frm_avgpool_k": 2,
+                "denoiser_unet_blocks_per_level": [2, 2, 2],
+                "L_diff_prior_l1": "eq15_second_term_mean",
+            },
+            "training_note": "DM on compact LPR; joint-train DM+DHRNet; infer S >= train S (paper Tab. 4). Multi-exp Xi=[Li,Hi] aligns with bracket+merge stacks in this repo.",
+        }
+    }
 
 
 def pq_eotf_bt2100(N: Tensor) -> Tensor:
