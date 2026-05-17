@@ -19,6 +19,16 @@ LTX-2 Pipelines provides production-ready implementations that abstract away the
 - 📦 **Self-Contained**: Handles model loading, encoding, decoding, and file I/O
 - 🚀 **CLI Support**: All pipelines can be run as command-line scripts
 
+### Kino: cinematic long takes
+
+This fork targets **long coherent takes**, **rich prompts** (Gemma long-context encoding; see `LTX_GEMMA_ENCODE_CAP` in [ltx-core](../ltx-core/README.md#text-encoding-gemma)), and **edit-style** assembly—not lowest-latency previews. Practical defaults:
+
+- **Quality**: Prefer **`TI2VidTwoStagesPipeline`** or **`TI2VidTwoStagesHQPipeline`** over one-stage or distilled-only runs when fidelity matters.
+- **Identity / anchors**: Use **`ConsistencyPipeline`** with hero images and optional keyframes; use **`RetakePipeline`** to fix a **time range** in an existing clip instead of re-rendering everything.
+- **Bridging**: **`KeyframeInterpolationPipeline`** between approved stills when helpful.
+
+Full narrative: **[docs/cinematic-long-form.md](../../docs/cinematic-long-form.md)**.
+
 ---
 
 ## 🚀 Quick Start
@@ -74,6 +84,8 @@ Use `--help` with any pipeline module to see all available options and parameter
 
 ### Quick Decision Tree
 
+For **maximum cinematic quality** on long or hero shots, prefer **two-stage** pipelines (**`TI2VidTwoStagesPipeline`** / **`TI2VidTwoStagesHQPipeline`**) and read **[docs/cinematic-long-form.md](../../docs/cinematic-long-form.md)**. The tree below is the general routing chart.
+
 ```text
 Do you need stronger subject identity consistency from references?
 ├─ YES → Use ConsistencyPipeline
@@ -96,7 +108,7 @@ Do you need to condition on existing images/videos?
 │
 └─ NO → Text-to-video only
    ├─ Do you need best quality?
-   │  └─ YES → Use TI2VidTwoStagesPipeline (recommended for production)
+   │  └─ YES → Use TI2VidTwoStagesPipeline (default production) or TI2VidTwoStagesHQPipeline (res_2s, often fewer steps)
    │
    └─ Do you need fastest inference?
       └─ YES → Use DistilledPipeline (with 8 predefined sigmas)

@@ -6,14 +6,22 @@
 [![Paper](https://img.shields.io/badge/Paper-PDF-EC1C24?logo=adobeacrobatreader&logoColor=white)](https://arxiv.org/abs/2601.03233)
 [![Discord](https://img.shields.io/badge/Join-Discord-5865F2?logo=discord)](https://discord.gg/ltxplatform)
 
-**Kino** is an expiramental fork of **LTX-2** is the first DiT-based audio-video foundation model that contains all core capabilities of modern video generation in one model: synchronized audio and video, high fidelity, multiple performance modes, production-ready outputs, API access, and open access.
+**Kino** is an experimental fork of **LTX-2**: a DiT-based audio-video foundation model with synchronized audio and video, high fidelity, multiple performance modes, and open access.
+
+## Cinematic long-form workflow
+
+Kino is optimized for **long coherent takes**, **text-driven camera and blocking**, and **edit-friendly** output—see **[docs/cinematic-long-form.md](docs/cinematic-long-form.md)** for the full playbook. In short:
+
+- **Long text context** — Gemma 4 with a generous encode window (default cap **8192** tokens; tune with `LTX_GEMMA_ENCODE_CAP`). Put structure in one prompt instead of fragmenting it.
+- **Prompt discipline** — One chronological shot-list paragraph; explicit layout, light, and **natural-language camera** (see [Prompting for Kino](#prompting-for-kino)).
+- **Two-stage + HQ** — Use **`TI2VidTwoStagesPipeline`** or **`TI2VidTwoStagesHQPipeline`** (res_2s sampler) for production quality; reserve faster pipelines for previews.
+- **Consistency + retake** — **`ConsistencyPipeline`** for hero/keyframe identity; **`RetakePipeline`** to regenerate only bad time ranges; **`KeyframeInterpolationPipeline`** to bridge approved stills.
 
 ## Quick Start
 
 ```bash
-# Clone the repository
-git clone https://github.com/Lightricks/LTX-2.git
-cd LTX-2
+git clone https://github.com/timfox/Kino.git
+cd Kino
 
 # Set up the environment
 uv sync --frozen
@@ -71,6 +79,7 @@ For identity-heavy generations, start with **ConsistencyPipeline**. It expands a
 
 ### Optimization Tips
 
+* **Cinematic quality first** — For hero shots and long takes, prefer **`TI2VidTwoStagesHQPipeline`** or **`TI2VidTwoStagesPipeline`** over single-stage or distilled-only paths; see [docs/cinematic-long-form.md](docs/cinematic-long-form.md).
 * **Use DistilledPipeline** - Fastest inference with only 8 predefined sigmas (8 steps stage 1, 4 steps stage 2)
 * **Enable FP8 quantization** - Enables lower memory footprint: `--quantization fp8-cast` (CLI) or `quantization=QuantizationPolicy.fp8_cast()` (Python). Fp8-cast should be used with bf16 checkpoints, it shall downcast them on the fly. For Hopper GPUs with TensorRT-LLM, use `--quantization fp8-scaled-mm` for FP8 scaled matrix multiplication. Fp8-scaled-mm should be used with fp8 checkpoints.
 * **Install attention optimizations** - Use xFormers (`uv sync --extra xformers`) or [Flash Attention 3](https://github.com/Dao-AILab/flash-attention) for Hopper GPUs
@@ -80,17 +89,19 @@ For identity-heavy generations, start with **ConsistencyPipeline**. It expands a
 
 ## Prompting for Kino
 
-When writing prompts, focus on detailed, chronological descriptions of actions and scenes. Include specific movements, appearances, camera angles, and environmental details - all in a single flowing paragraph. Start directly with the action, and keep descriptions literal and precise. Think like a cinematographer describing a shot list. Keep within 200 words. For best results, build your prompts using this structure:
+Write **one chronological shot-list paragraph**: actions, blocking, environment, light, and **camera in plain language** (lens feel, height, dolly/pan/static). Stay literal and ordered in time. The [LTX-2 prompting guide](https://ltx.video/blog/how-to-prompt-for-ltx-2) suggests keeping prompts concise (~200 words); with **Gemma 4** and the default **long encode window** (see `LTX_GEMMA_ENCODE_CAP` in [ltx-core](packages/ltx-core/README.md)), you can extend that when extra text adds real structure (beats, spatial layout, camera progression)—avoid filler.
+
+Suggested checklist:
 
 - Start with main action in a single sentence
 - Add specific details about movements and gestures
 - Describe character/object appearances precisely
-- Include background and environment details
-- Specify camera angles and movements
+- Include background and environment **layout** (spatial anchors)
+- Specify camera angles and movements in **natural language**
 - Describe lighting and colors
-- Note any changes or sudden events
+- Note changes or beats in order
 
-For additional guidance on writing a prompt please refer to <https://ltx.video/blog/how-to-prompt-for-ltx-2>
+More workflow context: [docs/cinematic-long-form.md](docs/cinematic-long-form.md).
 
 ### Automatic Prompt Enhancement
 
@@ -111,6 +122,8 @@ This repository is organized as a monorepo with three main packages:
 Each package has its own README and documentation. See the [Documentation](#-documentation) section below.
 
 ## Documentation
+
+* **[Cinematic long-form workflow](docs/cinematic-long-form.md)** — Long text context, prompting, two-stage/HQ pipelines, consistency, and retake assembly.
 
 Each package includes comprehensive documentation:
 

@@ -12,6 +12,10 @@ Run: ls src/ltx_pipelines/*.py to check for new pipeline files.
 
 Inference pipelines for LTX-2 audio-video generation. Depends on `ltx-core` for model definitions, diffusion components, and loading. All pipelines live in `packages/ltx-pipelines/src/ltx_pipelines/`.
 
+## Kino product priorities
+
+Prioritize **cinematic long-form** workflows documented in **[`docs/cinematic-long-form.md`](../../docs/cinematic-long-form.md)**: long Gemma prompt context (`LTX_GEMMA_ENCODE_CAP`), disciplined shot-list prompting, **`TI2VidTwoStagesPipeline` / `TI2VidTwoStagesHQPipeline`** for quality, **`ConsistencyPipeline`** for identity anchors, **`RetakePipeline`** for partial reruns, **`KeyframeInterpolationPipeline`** when bridging stills. Do not treat real-time interactive world models as the default use case.
+
 ## Pipeline selection
 
 | Pipeline | File | Stages | Model | Sampler | Use case |
