@@ -110,6 +110,18 @@ This repository is organized as a monorepo with three main packages:
 
 Each package has its own README and documentation. See the [Documentation](#-documentation) section below.
 
+## NVIDIA SANA stack (reference submodule)
+
+This repo vendors **[NVlabs/Sana](https://github.com/NVlabs/Sana)** under `third_party/nv-sana` as a **git submodule** (Apache-2.0). That tree is the public home for efficiency-oriented research used alongside **LTX-2** in papers such as **SANA-Video** (linear / block-linear DiT) and **SANA-WM** (minute-scale, camera-controlled world modeling with the **LTX2** tokenizer and a long-video refiner). Track NVIDIA’s docs for **SANA-WM** training/inference code availability; until then, the submodule still provides **schedulers**, **LongSANA** / **SANA-Video** scripts, and diffusers conversion utilities useful for cross-checking latents and sampling.
+
+After clone, initialize it with:
+
+```bash
+git submodule update --init --recursive
+```
+
+See [`third_party/README.md`](third_party/README.md) for bumping the submodule pointer.
+
 ## Documentation
 
 Each package includes comprehensive documentation:

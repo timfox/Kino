@@ -1,0 +1,3 @@
+[submodule "third_party/nv-sana"]
+	path = third_party/nv-sana
+	url = https://github.com/NVlabs/Sana.git
