@@ -45,6 +45,7 @@ from ltx_trainer.sigma_tracker import SigmaBucketTracker
 from ltx_trainer.timestep_samplers import SAMPLERS
 from ltx_trainer.training_state import ConfigFingerprint, RngStates, TrainingState
 from ltx_trainer.training_strategies import get_training_strategy
+from ltx_trainer.media_formats import is_still_image_path
 from ltx_trainer.utils import open_image_as_srgb, save_image
 from ltx_trainer.validation_sampler import CachedPromptEmbeddings, GenerationConfig, ValidationSampler
 from ltx_trainer.video_utils import read_video, save_video
@@ -79,6 +80,16 @@ def _text_embed_sidecar_path(main_weights_path: Path) -> Path:
     return main_weights_path.with_name(f"text_embeds_{name}")
 
 
+def _text_stack_sidecar_path(main_weights_path: Path) -> Path:
+    """``lora_weights_step_00001.safetensors`` → ``text_stack_weights_step_00001.safetensors``."""
+    name = main_weights_path.name
+    marker = "weights_step_"
+    if marker in name:
+        idx = name.index(marker)
+        return main_weights_path.with_name(f"text_stack_{name[idx:]}")
+    return main_weights_path.with_name(f"text_stack_{name}")
+
+
 def _text_connector_state_dict_for_save(embeddings_processor: EmbeddingsProcessor) -> dict[str, Tensor]:
     out: dict[str, Tensor] = {}
     for k, v in embeddings_processor.video_connector.state_dict().items():
@@ -99,6 +110,25 @@ def _load_text_connector_sidecar(embeddings_processor: EmbeddingsProcessor, path
             logger.warning("Text-embed sidecar has audio_connector.* keys but no audio_connector on processor; skipped")
         else:
             embeddings_processor.audio_connector.load_state_dict(a_sd, strict=True)
+
+
+def _save_text_stack_sidecar(embeddings_processor: EmbeddingsProcessor, path: Path, save_dtype: torch.dtype) -> None:
+    from ltx_trainer.text_stack_utils import feature_extractor_state_dict
+
+    if embeddings_processor.feature_extractor is None:
+        return
+    te_sd = feature_extractor_state_dict(embeddings_processor.feature_extractor)
+    te_sd = {k: v.to(save_dtype) if isinstance(v, Tensor) else v for k, v in te_sd.items()}
+    save_file(te_sd, path)
+
+
+def _load_text_stack_sidecar(embeddings_processor: EmbeddingsProcessor, path: Path) -> None:
+    from ltx_trainer.text_stack_utils import load_feature_extractor_state_dict
+
+    if embeddings_processor.feature_extractor is None:
+        logger.warning("Cannot load text_stack sidecar: feature_extractor is None")
+        return
+    load_feature_extractor_state_dict(embeddings_processor.feature_extractor, load_file(path))
 
 
 class TrainingStats(BaseModel):
@@ -126,6 +156,7 @@ class LtxvTrainer:
         if IS_MAIN_PROCESS:
             print_config(trainer_config)
         self._training_strategy = get_training_strategy(self._config.training_strategy)
+        self._text_encoder = None
         self._cached_validation_embeddings = self._load_text_encoder_and_cache_embeddings()
         self._load_models()
         self._setup_accelerator()
@@ -141,15 +172,17 @@ class LtxvTrainer:
         self._wandb_run = None
         self._sigma_tracker = SigmaBucketTracker()
 
-        if (
-            self._config.model.finetune_text_connectors
-            and self._config.validation.prompts
-            and self._cached_validation_embeddings
-        ):
-            logger.warning(
-                "model.finetune_text_connectors is on: cached validation prompt embeddings were computed with the "
-                "initial connector weights and will not reflect connector updates during training."
-            )
+        if self._config.model.finetune_text_connectors and self._config.validation.prompts:
+            if self._cached_validation_embeddings and not all(
+                e.features_pre_connector for e in self._cached_validation_embeddings
+            ):
+                logger.warning(
+                    "Validation cache is post-connector; re-run with finetune_text_connectors to use pre-connector cache."
+                )
+            elif self._cached_validation_embeddings:
+                logger.info(
+                    "finetune_text_connectors: validation uses pre-connector features + live connectors each sample."
+                )
 
     def train(  # noqa: PLR0912, PLR0915
         self,
@@ -393,27 +426,29 @@ class LtxvTrainer:
 
     def _training_step(self, batch: dict[str, dict[str, Tensor]]) -> TrainingStepOutput:
         """Perform a single training step using the configured strategy."""
-        # Apply embedding connectors to transform pre-computed text embeddings
         conditions = batch["conditions"]
 
-        if "video_prompt_embeds" in conditions:
-            # New format: separate video/audio features from precompute()
-            video_features = conditions["video_prompt_embeds"]
-            audio_features = conditions.get("audio_prompt_embeds")
+        if self._config.model.finetune_text_stack and self._config.model.text_stack_live_captions:
+            video_embeds, audio_embeds, attention_mask = self._encode_live_captions(batch)
+            conditions["video_prompt_embeds"] = video_embeds
+            conditions["audio_prompt_embeds"] = audio_embeds
+            conditions["prompt_attention_mask"] = attention_mask
         else:
-            # Legacy format: single prompt_embeds tensor — duplicate for both modalities
-            video_features = conditions["prompt_embeds"]
-            audio_features = conditions["prompt_embeds"]
+            if "video_prompt_embeds" in conditions:
+                video_features = conditions["video_prompt_embeds"]
+                audio_features = conditions.get("audio_prompt_embeds")
+            else:
+                video_features = conditions["prompt_embeds"]
+                audio_features = conditions["prompt_embeds"]
 
-        mask = conditions["prompt_attention_mask"]
-        additive_mask = convert_to_additive_mask(mask, video_features.dtype)
-        video_embeds, audio_embeds, attention_mask = self._embeddings_processor.create_embeddings(
-            video_features, audio_features, additive_mask
-        )
-
-        conditions["video_prompt_embeds"] = video_embeds
-        conditions["audio_prompt_embeds"] = audio_embeds
-        conditions["prompt_attention_mask"] = attention_mask
+            mask = conditions["prompt_attention_mask"]
+            additive_mask = convert_to_additive_mask(mask, video_features.dtype)
+            video_embeds, audio_embeds, attention_mask = self._embeddings_processor.create_embeddings(
+                video_features, audio_features, additive_mask
+            )
+            conditions["video_prompt_embeds"] = video_embeds
+            conditions["audio_prompt_embeds"] = audio_embeds
+            conditions["prompt_attention_mask"] = attention_mask
 
         # Use strategy to prepare training inputs (returns ModelInputs with Modality objects)
         model_inputs = self._training_strategy.prepare_training_inputs(batch, self._timestep_sampler)
@@ -430,6 +465,33 @@ class LtxvTrainer:
         sigma = model_inputs.video.sigma.detach() if model_inputs.video.enabled else model_inputs.audio.sigma.detach()
 
         return TrainingStepOutput(loss=loss, sigma=sigma)
+
+    def _encode_live_captions(self, batch: dict) -> tuple[Tensor, Tensor | None, Tensor]:
+        """Gemma encode → feature_extractor → connectors for each sample in the batch."""
+        if self._text_encoder is None:
+            raise RuntimeError("Live caption training requires text_encoder (finetune_text_stack + text_stack_live_captions)")
+        raw = batch.get("caption")
+        if raw is None:
+            raise KeyError("Batch missing 'caption'; set data.dataset_manifest_path for live text-stack training")
+        captions: list[str] = [raw] if isinstance(raw, str) else list(raw)
+
+        device = self._accelerator.device
+        video_parts: list[Tensor] = []
+        audio_parts: list[Tensor] = []
+        mask_parts: list[Tensor] = []
+
+        for caption in captions:
+            hidden_states, prompt_mask = self._text_encoder.encode(caption, padding_side="left")
+            out = self._embeddings_processor.process_hidden_states(hidden_states, prompt_mask, "left")
+            video_parts.append(out.video_encoding)
+            mask_parts.append(out.attention_mask)
+            if out.audio_encoding is not None:
+                audio_parts.append(out.audio_encoding)
+
+        video_embeds = torch.cat(video_parts, dim=0).to(device)
+        attention_mask = torch.cat(mask_parts, dim=0).to(device)
+        audio_embeds = torch.cat(audio_parts, dim=0).to(device) if audio_parts else None
+        return video_embeds, audio_embeds, attention_mask
 
     @free_gpu_memory_context(after=True)
     def _load_text_encoder_and_cache_embeddings(self) -> list[CachedPromptEmbeddings] | None:
@@ -469,30 +531,57 @@ class LtxvTrainer:
         if self._config.validation.prompts:
             logger.info(f"Pre-computing embeddings for {len(self._config.validation.prompts)} validation prompts...")
             cached_embeddings = []
+            cache_pre_connector = bool(self._config.model.finetune_text_connectors)
             with torch.inference_mode():
                 for prompt in self._config.validation.prompts:
                     pos_hs, pos_mask = text_encoder.encode(prompt)
-                    pos_out = self._embeddings_processor.process_hidden_states(pos_hs, pos_mask)
-
                     neg_hs, neg_mask = text_encoder.encode(self._config.validation.negative_prompt)
-                    neg_out = self._embeddings_processor.process_hidden_states(neg_hs, neg_mask)
-
-                    cached_embeddings.append(
-                        CachedPromptEmbeddings(
-                            video_context_positive=pos_out.video_encoding.cpu(),
-                            audio_context_positive=pos_out.audio_encoding.cpu(),
-                            video_context_negative=neg_out.video_encoding.cpu(),
-                            audio_context_negative=(
-                                neg_out.audio_encoding.cpu() if neg_out.audio_encoding is not None else None
-                            ),
+                    if cache_pre_connector:
+                        pos_v, pos_a = self._embeddings_processor.feature_extractor(pos_hs, pos_mask, "left")
+                        neg_v, neg_a = self._embeddings_processor.feature_extractor(neg_hs, neg_mask, "left")
+                        cached_embeddings.append(
+                            CachedPromptEmbeddings(
+                                video_context_positive=pos_v.cpu(),
+                                audio_context_positive=pos_a.cpu() if pos_a is not None else None,
+                                video_context_negative=neg_v.cpu(),
+                                audio_context_negative=neg_a.cpu() if neg_a is not None else None,
+                                prompt_attention_mask_positive=pos_mask.cpu(),
+                                prompt_attention_mask_negative=neg_mask.cpu(),
+                                features_pre_connector=True,
+                            )
                         )
-                    )
+                    else:
+                        pos_out = self._embeddings_processor.process_hidden_states(pos_hs, pos_mask)
+                        neg_out = self._embeddings_processor.process_hidden_states(neg_hs, neg_mask)
+                        cached_embeddings.append(
+                            CachedPromptEmbeddings(
+                                video_context_positive=pos_out.video_encoding.cpu(),
+                                audio_context_positive=(
+                                    pos_out.audio_encoding.cpu() if pos_out.audio_encoding is not None else None
+                                ),
+                                video_context_negative=neg_out.video_encoding.cpu(),
+                                audio_context_negative=(
+                                    neg_out.audio_encoding.cpu() if neg_out.audio_encoding is not None else None
+                                ),
+                            )
+                        )
 
-        # Unload Gemma model and feature extractor, keep only connectors for training
-        del text_encoder
-        self._embeddings_processor.feature_extractor = None
+        keep_live = bool(self._config.model.finetune_text_stack and self._config.model.text_stack_live_captions)
+        if keep_live:
+            self._text_encoder = text_encoder
+            logger.info(
+                "finetune_text_stack: keeping Gemma text encoder and feature_extractor on GPU for live captions"
+            )
+        else:
+            del text_encoder
 
-        logger.debug("Validation prompt embeddings cached. Gemma model unloaded")
+        if not self._config.model.finetune_text_stack:
+            self._embeddings_processor.feature_extractor = None
+            logger.debug("Validation prompt embeddings cached. Gemma model unloaded; feature_extractor dropped")
+        elif not keep_live:
+            del text_encoder
+            logger.debug("Text stack training without live captions uses precomputed features only")
+
         return cached_embeddings
 
     def _load_models(self) -> None:
@@ -559,11 +648,13 @@ class LtxvTrainer:
 
     def _collect_trainable_params(self) -> None:
         """Collect trainable parameters based on training mode."""
-        if self._config.model.training_mode == "lora":
-            # For LoRA training, first set up LoRA layers
+        freeze_dit = bool(self._config.model.finetune_text_stack and self._config.model.text_stack_freeze_dit)
+
+        if freeze_dit:
+            self._transformer.requires_grad_(False)
+        elif self._config.model.training_mode == "lora":
             self._setup_lora()
         elif self._config.model.training_mode == "full":
-            # For full training, unfreeze all transformer parameters
             self._transformer.requires_grad_(True)
         else:
             raise ValueError(f"Unknown training mode: {self._config.model.training_mode}")
@@ -571,6 +662,17 @@ class LtxvTrainer:
         self._trainable_params = [p for p in self._transformer.parameters() if p.requires_grad]
         n_diffusion = sum(p.numel() for p in self._trainable_params)
         mode = self._config.model.training_mode
+
+        if self._config.model.finetune_text_stack:
+            fe = self._embeddings_processor.feature_extractor
+            if fe is None:
+                raise RuntimeError("finetune_text_stack requires feature_extractor on the embeddings processor")
+            fe.requires_grad_(True)
+            fe_params = [p for p in fe.parameters() if p.requires_grad]
+            self._trainable_params.extend(fe_params)
+            n_fe = sum(p.numel() for p in fe_params)
+            logger.info("Trainable text stack (feature_extractor): %s parameters", f"{n_fe:,}")
+
         if self._config.model.finetune_text_connectors:
             self._embeddings_processor.video_connector.requires_grad_(True)
             if self._embeddings_processor.audio_connector is not None:
@@ -649,6 +751,7 @@ class LtxvTrainer:
 
         logger.info("✅ Full model checkpoint loaded successfully")
         self._maybe_load_text_embed_connector_checkpoint(checkpoint_path)
+        self._maybe_load_text_stack_checkpoint(checkpoint_path)
 
     def _load_lora_checkpoint(self, checkpoint_path: Path) -> None:
         """Load LoRA checkpoint with DDP/FSDP compatibility."""
@@ -664,6 +767,16 @@ class LtxvTrainer:
 
         logger.info("✅ LoRA checkpoint loaded successfully")
         self._maybe_load_text_embed_connector_checkpoint(checkpoint_path)
+        self._maybe_load_text_stack_checkpoint(checkpoint_path)
+
+    def _maybe_load_text_stack_checkpoint(self, main_checkpoint: Path) -> None:
+        if not self._config.model.finetune_text_stack:
+            return
+        sidecar = _text_stack_sidecar_path(main_checkpoint)
+        if not sidecar.is_file():
+            return
+        _load_text_stack_sidecar(self._embeddings_processor, sidecar)
+        logger.info("Loaded text stack weights from %s", sidecar)
 
     def _maybe_load_text_embed_connector_checkpoint(self, main_checkpoint: Path) -> None:
         if not self._config.model.finetune_text_connectors:
@@ -706,6 +819,8 @@ class LtxvTrainer:
             mismatches.append(
                 f"finetune_text_connectors: {fp.finetune_text_connectors} → {cfg.model.finetune_text_connectors}"
             )
+        if bool(fp.finetune_text_stack) != bool(cfg.model.finetune_text_stack):
+            mismatches.append(f"finetune_text_stack: {fp.finetune_text_stack} → {cfg.model.finetune_text_stack}")
         if mismatches:
             logger.warning(
                 f"⚠️ Training state config mismatch ({', '.join(mismatches)}). "
@@ -839,8 +954,19 @@ class LtxvTrainer:
             # Get data sources from the training strategy
             data_sources = self._training_strategy.get_data_sources()
 
-            self._dataset = PrecomputedDataset(self._config.data.preprocessed_data_root, data_sources=data_sources)
+            caption_index = None
+            if self._config.model.finetune_text_stack and self._config.model.text_stack_live_captions:
+                from ltx_trainer.text_stack_utils import load_caption_index
+
+                caption_index = load_caption_index(self._config.data.dataset_manifest_path)
+            self._dataset = PrecomputedDataset(
+                self._config.data.preprocessed_data_root,
+                data_sources=data_sources,
+                caption_index=caption_index,
+            )
             logger.debug(f"Loaded dataset with {len(self._dataset):,} samples from sources: {list(data_sources)}")
+            if caption_index:
+                logger.info("Live captions: %s manifest entries", f"{len(caption_index):,}")
 
         num_workers = self._config.data.num_dataloader_workers
         dataloader = DataLoader(
@@ -1004,6 +1130,7 @@ class LtxvTrainer:
             audio_decoder=self._audio_vae if generate_audio else None,
             vocoder=self._vocoder if generate_audio else None,
             sampling_context=sampling_ctx,
+            embeddings_processor=self._embeddings_processor,
         )
 
         output_dir = Path(self._config.output_dir) / "samples"
@@ -1157,6 +1284,14 @@ class LtxvTrainer:
                     self._global_step,
                     te_path.relative_to(self._config.output_dir),
                 )
+            if self._config.model.finetune_text_stack:
+                ts_path = _text_stack_sidecar_path(saved_weights_path)
+                _save_text_stack_sidecar(self._embeddings_processor, ts_path, save_dtype)
+                logger.info(
+                    "Text stack weights for step %s saved in %s",
+                    self._global_step,
+                    ts_path.relative_to(self._config.output_dir),
+                )
         else:
             # Cast to configured precision
             full_state_dict = {k: v.to(save_dtype) if isinstance(v, Tensor) else v for k, v in full_state_dict.items()}
@@ -1172,6 +1307,14 @@ class LtxvTrainer:
                     "Text connector weights for step %s saved in %s",
                     self._global_step,
                     te_path.relative_to(self._config.output_dir),
+                )
+            if self._config.model.finetune_text_stack:
+                ts_path = _text_stack_sidecar_path(saved_weights_path)
+                _save_text_stack_sidecar(self._embeddings_processor, ts_path, save_dtype)
+                logger.info(
+                    "Text stack weights for step %s saved in %s",
+                    self._global_step,
+                    ts_path.relative_to(self._config.output_dir),
                 )
 
         rel_path = saved_weights_path.relative_to(self._config.output_dir)
@@ -1196,6 +1339,10 @@ class LtxvTrainer:
                 if te.exists():
                     te.unlink()
                     logger.info(f"Removed old text-embed checkpoint: {te}")
+                ts = _text_stack_sidecar_path(old_checkpoint)
+                if ts.exists():
+                    ts.unlink()
+                    logger.info(f"Removed old text-stack checkpoint: {ts}")
             self._checkpoint_paths = self._checkpoint_paths[-self._config.checkpoints.keep_last_n :]
 
     def _save_training_state(self, save_dir: Path) -> None:
@@ -1232,6 +1379,7 @@ class LtxvTrainer:
                 training_mode=self._config.model.training_mode,
                 lora_rank=self._config.lora.rank if self._config.lora is not None else None,
                 finetune_text_connectors=self._config.model.finetune_text_connectors,
+                finetune_text_stack=self._config.model.finetune_text_stack,
             ),
             rng_states=RngStates(
                 torch_state=torch.random.get_rng_state(),
@@ -1336,7 +1484,7 @@ class LtxvTrainer:
             return
 
         # Determine if outputs are images or videos based on file extension
-        is_image = sample_paths and sample_paths[0].suffix.lower() in (".png", ".jpg", ".jpeg", ".heic", ".webp")
+        is_image = sample_paths and is_still_image_path(sample_paths[0])
 
         if is_image:
             samples = [

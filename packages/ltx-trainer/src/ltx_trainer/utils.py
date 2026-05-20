@@ -3,8 +3,30 @@ from pathlib import Path
 
 import numpy as np
 import torch
+from ltx_trainer.media_formats import is_canon_raw_path
 from PIL import ExifTags, Image, ImageCms, ImageOps
 from PIL.Image import Image as PilImage
+
+
+def _open_canon_raw_as_pil(image_path: str | Path) -> PilImage:
+    """Decode Canon Raw (.cr2 / .cr3 / .crw) to RGB via rawpy (LibRaw)."""
+    try:
+        import rawpy
+    except ImportError as e:
+        raise ImportError(
+            "Canon Raw (.cr2, .cr3, .crw) requires the optional ``rawpy`` package. "
+            "Install with: pip install rawpy"
+        ) from e
+
+    path = Path(image_path)
+    with rawpy.imread(str(path)) as raw:
+        rgb = raw.postprocess(
+            use_camera_wb=True,
+            no_auto_bright=False,
+            output_color=rawpy.ColorSpace.sRGB,
+            output_bps=8,
+        )
+    return Image.fromarray(rgb, mode="RGB")
 
 
 def open_image_as_srgb(image_path: str | Path | io.BytesIO) -> PilImage:
@@ -16,6 +38,9 @@ def open_image_as_srgb(image_path: str | Path | io.BytesIO) -> PilImage:
     Returns:
         PIL Image in sRGB color space
     """
+    if isinstance(image_path, (str, Path)) and is_canon_raw_path(image_path):
+        return _open_canon_raw_as_pil(image_path)
+
     exif_colorspace_srgb = 1
 
     with Image.open(image_path) as img_raw:

@@ -322,16 +322,12 @@ def _resolve_transfer_mode(stream: Any, hdr_transfer: str) -> str:
     return "srgb"
 
 
-def _frame_to_rgb01(frame: av.VideoFrame) -> Tensor:
-    """``[C, H, W]`` float32 in ``[0, 1]`` (display/code values). Prefer 16-bit RGB when available."""
-    try:
-        conv = frame.reformat(format="rgb48le")
-        arr = conv.to_ndarray()
-        t = torch.from_numpy(np.ascontiguousarray(arr)).float().permute(2, 0, 1).div_(65535.0)
-    except Exception:
-        arr = frame.to_ndarray(format="rgb24")
-        t = torch.from_numpy(np.ascontiguousarray(arr)).float().permute(2, 0, 1).div_(255.0)
-    return t
+def _frame_to_rgb01(frame: av.VideoFrame, colorspace_ctx: Any | None = None) -> Tensor:
+    """``[C, H, W]`` float32 in ``[0, 1]`` via FFmpeg-style YUV420 when the frame is planar YUV."""
+    from ltx_trainer.yuv_colorspace import av_frame_to_rgb01
+
+    rgb, _ = av_frame_to_rgb01(frame, colorspace_ctx)
+    return rgb
 
 
 def _to_scene_linear(rgb01: Tensor, transfer_mode: str) -> Tensor:
@@ -381,6 +377,60 @@ def image_rgb01_chw_to_scene_linear_fchw(
     return lin.unsqueeze(0), meta
 
 
+def _read_video_hdr_via_ffmpeg(
+    path: Path,
+    *,
+    max_frames: int | None,
+    hdr_transfer: str,
+) -> tuple[Tensor, float, dict[str, Any]]:
+    """HDR-ish decode for QuickTime/MOV when PyAV is unreliable (treats ffmpeg RGB as display-coded)."""
+    from ltx_trainer.ffmpeg_io import probe_media
+    from ltx_trainer.video_utils import _read_video_ffmpeg
+
+    pr = probe_media(path)
+    fps = float(pr.video.avg_fps if pr.video else 24.0)
+    ht = hdr_transfer.strip().lower()
+    resolved = _resolve_transfer_mode_from_probe(pr, hdr_transfer) if ht == "auto" else ht
+    if resolved not in ("pq", "hlg", "srgb", "linear"):
+        resolved = "srgb"
+
+    rgb_fchw, _ = _read_video_ffmpeg(path, max_frames)
+    frames = [_to_scene_linear(rgb_fchw[f], resolved) for f in range(rgb_fchw.shape[0])]
+    if not frames:
+        raise RuntimeError(f"No video frames decoded from {path}")
+
+    meta: dict[str, Any] = {
+        "hdr_transfer_requested": hdr_transfer,
+        "hdr_transfer_resolved": resolved,
+        "decode_backend": "ffmpeg",
+        "container_format": pr.format_name,
+        "still_image_ingest": False,
+    }
+    if pr.video:
+        meta["color_trc"] = pr.video.color_transfer or resolved
+        meta["color_primaries"] = pr.video.color_primaries or "unknown"
+        meta["color_space"] = pr.video.color_space or "unknown"
+    try:
+        from ltx_trainer.ffmpeg_io import colorspace_context_from_probe
+
+        meta.update(colorspace_context_from_probe(pr))
+    except Exception:
+        pass
+    return torch.stack(frames, dim=0), fps, meta
+
+
+def _resolve_transfer_mode_from_probe(pr: Any, hdr_transfer: str) -> str:
+    ht = hdr_transfer.strip().lower()
+    if ht != "auto":
+        return ht
+    trc = (pr.video.color_transfer or "").lower() if pr.video else ""
+    if "2084" in trc or "smpte2084" in trc:
+        return "pq"
+    if "arib" in trc or "hlg" in trc or "std-b67" in trc:
+        return "hlg"
+    return "srgb"
+
+
 def read_video_hdr_float32(
     video_path: str | Path,
     max_frames: int | None = None,
@@ -402,24 +452,54 @@ def read_video_hdr_float32(
         raise ValueError(
             f"Unknown hdr_transfer {hdr_transfer!r}; expected auto, pq, hlg, srgb, or linear"
         )
+    from ltx_trainer import logger
+    from ltx_trainer.video_utils import _use_ffmpeg_decode
+
     path = Path(video_path)
-    with av.open(str(path)) as container:
+    if _use_ffmpeg_decode(path):
+        return _read_video_hdr_via_ffmpeg(path, max_frames=max_frames, hdr_transfer=hdr_transfer)
+
+    try:
+        return _read_video_hdr_pyav(path, max_frames=max_frames, hdr_transfer=hdr_transfer)
+    except Exception as exc:
+        logger.debug("PyAV HDR decode failed for %s (%s); falling back to ffmpeg", path, exc)
+        return _read_video_hdr_via_ffmpeg(path, max_frames=max_frames, hdr_transfer=hdr_transfer)
+
+
+def _read_video_hdr_pyav(
+    path: Path,
+    *,
+    max_frames: int | None,
+    hdr_transfer: str,
+) -> tuple[Tensor, float, dict[str, Any]]:
+    from ltx_trainer.dav1d_decode import decode_info_to_meta, iter_video_frames, open_video_container
+    from ltx_trainer.yuv_colorspace import colorspace_context_from_av_stream
+
+    with open_video_container(path) as container:
         vstream = container.streams.video[0]
         fps = float(vstream.average_rate or vstream.base_rate or 24)
         resolved = _resolve_transfer_mode(vstream, hdr_transfer)
+        cs_ctx = colorspace_context_from_av_stream(vstream)
+        frame_iter, decode_info = iter_video_frames(container, max_frames=max_frames)
         meta: dict[str, Any] = {
             "hdr_transfer_requested": hdr_transfer,
             "hdr_transfer_resolved": resolved,
             "color_trc": _color_trc_name(vstream),
             "color_primaries": str(getattr(vstream.codec_context, "color_primaries", None)),
-            "color_space": str(getattr(vstream.codec_context, "color_space", None)),
+            "color_space": str(getattr(vstream.codec_context, "colorspace", None)),
+            **cs_ctx.to_meta(),
+            **decode_info_to_meta(decode_info),
         }
+        try:
+            from ltx_trainer.ffmpeg_io import colorspace_context_from_probe, probe_media
+
+            meta.update(colorspace_context_from_probe(probe_media(path)))
+        except Exception:
+            pass
 
         frames: list[Tensor] = []
-        for frame in container.decode(video=0):
-            if max_frames is not None and len(frames) >= max_frames:
-                break
-            rgb01 = _frame_to_rgb01(frame)
+        for frame in frame_iter:
+            rgb01 = _frame_to_rgb01(frame, cs_ctx)
             frames.append(_to_scene_linear(rgb01, resolved))
 
     if not frames:

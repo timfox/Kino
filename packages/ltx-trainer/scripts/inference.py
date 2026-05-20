@@ -320,6 +320,26 @@ def main() -> None:  # noqa: PLR0912, PLR0915
         default=None,
         help="Output audio path (.wav, optional - if not provided, audio will be embedded in video)",
     )
+    parser.add_argument(
+        "--export-sfm",
+        type=str,
+        default=None,
+        metavar="DIR",
+        help="After saving the video, run SfM and write poses/point cloud under DIR",
+    )
+    parser.add_argument(
+        "--sfm-backend",
+        type=str,
+        choices=["auto", "colmap", "opencv"],
+        default="auto",
+        help="SfM backend when --export-sfm is set",
+    )
+    parser.add_argument(
+        "--sfm-max-frames",
+        type=int,
+        default=120,
+        help="Max frames sampled for SfM when --export-sfm is set",
+    )
 
     # Device arguments
     parser.add_argument(
@@ -486,6 +506,19 @@ def main() -> None:  # noqa: PLR0912, PLR0915
         audio_sample_rate=audio_sample_rate,
     )
     print(f"✓ Video saved to {args.output}")
+
+    if args.export_sfm:
+        from ltx_trainer.sfm_export import export_sfm_from_video
+
+        sfm_dir = Path(args.export_sfm)
+        print(f"\nExporting structure-from-motion to {sfm_dir}...")
+        result = export_sfm_from_video(
+            output_path,
+            sfm_dir,
+            backend=args.sfm_backend,  # type: ignore[arg-type]
+            max_frames=args.sfm_max_frames,
+        )
+        print(f"✓ SfM: backend={result.backend}, {len(result.cameras)} cameras, {result.num_points} points")
 
     # Save separate audio file if requested
     if audio is not None and args.audio_output is not None:

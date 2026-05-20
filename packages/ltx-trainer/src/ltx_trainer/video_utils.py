@@ -1,8 +1,13 @@
-"""Video I/O utilities using PyAV.
-This module provides functions for reading and writing video files using PyAV,
-with optional audio support.
+"""Video I/O utilities for LTX training and dataset prep.
+
+**Decode:** PyAV by default; set ``LTX_VIDEO_BACKEND=ffmpeg`` to use :mod:`ltx_trainer.ffmpeg_io`
+(rawvideo pipe, filter graphs, optional hardware decode). AV1 via PyAV can use **libdav1d**
+(:mod:`ltx_trainer.dav1d_decode`, ``LTX_PREFER_DAV1D``).
+
+**Probe / cut / scene detect:** use :mod:`ltx_trainer.ffmpeg_io` directly.
 """
 
+import os
 from fractions import Fraction
 from pathlib import Path
 from typing import Literal
@@ -10,9 +15,49 @@ from typing import Literal
 import av
 import numpy as np
 import torch
+from ltx_trainer import logger
+from ltx_trainer.media_formats import prefer_ffmpeg_video_decode
 from torch import Tensor
 
 VideoFormat = Literal["CFHW", "FCHW"]
+
+
+def _video_backend() -> str:
+    return os.environ.get("LTX_VIDEO_BACKEND", "pyav").strip().lower()
+
+
+def _use_ffmpeg_decode(video_path: str | Path) -> bool:
+    if _video_backend() == "ffmpeg":
+        return True
+    return prefer_ffmpeg_video_decode(video_path)
+
+
+def _read_video_ffmpeg(video_path: str | Path, max_frames: int | None) -> tuple[Tensor, float]:
+    from ltx_trainer.ffmpeg_io import read_rgb_frames
+
+    frames, fps = read_rgb_frames(video_path, max_frames=max_frames)
+    video = torch.from_numpy(frames).float().div_(255.0).permute(0, 3, 1, 2)
+    return video, fps
+
+
+def _read_video_pyav(video_path: str | Path, max_frames: int | None) -> tuple[Tensor, float]:
+    from ltx_trainer.dav1d_decode import iter_video_frames, open_video_container
+    from ltx_trainer.yuv_colorspace import av_frame_to_rgb01, colorspace_context_from_av_stream
+
+    with open_video_container(video_path) as container:
+        video_stream = container.streams.video[0]
+        fps = float(video_stream.average_rate or video_stream.base_rate or 24)
+
+        cs_ctx = colorspace_context_from_av_stream(video_stream)
+        frames = []
+        frame_iter, _decode_info = iter_video_frames(container, max_frames=max_frames)
+        for frame in frame_iter:
+            rgb01, _ = av_frame_to_rgb01(frame, cs_ctx)
+            frames.append(rgb01.permute(1, 2, 0).numpy())
+
+    frames_np = np.stack(frames, axis=0)  # [F, H, W, C]
+    video = torch.from_numpy(frames_np).float()
+    return video.permute(0, 3, 1, 2), fps  # [F, C, H, W]
 
 
 def get_video_frame_count(video_path: str | Path) -> int:
@@ -25,6 +70,21 @@ def get_video_frame_count(video_path: str | Path) -> int:
     Returns:
         Number of frames in the video
     """
+    if _use_ffmpeg_decode(video_path):
+        from ltx_trainer.ffmpeg_io import estimate_frame_count
+
+        return estimate_frame_count(video_path)
+
+    try:
+        return _get_video_frame_count_pyav(video_path)
+    except Exception as exc:
+        logger.debug("PyAV frame count failed for %s (%s); using ffprobe", video_path, exc)
+        from ltx_trainer.ffmpeg_io import estimate_frame_count
+
+        return estimate_frame_count(video_path)
+
+
+def _get_video_frame_count_pyav(video_path: str | Path) -> int:
     with av.open(str(video_path)) as container:
         video_stream = container.streams.video[0]
 
@@ -39,30 +99,28 @@ def get_video_frame_count(video_path: str | Path) -> int:
             return round(duration * Fraction(rate))
 
         # Last resort: full decode (very slow for 4K)
-        return sum(1 for _ in container.decode(video=0))
+        from ltx_trainer.dav1d_decode import iter_video_frames
+
+        frame_iter, _ = iter_video_frames(container, stream_index=0)
+        return sum(1 for _ in frame_iter)
 
 
 def read_video(video_path: str | Path, max_frames: int | None = None) -> tuple[Tensor, float]:
-    """Load frames from a video file using PyAV.
+    """Load frames from a video file (PyAV by default; ffmpeg for ``.mov`` / on failure).
     Args:
         video_path: Path to the video file
         max_frames: Maximum number of frames to read. If None, reads all frames.
     Returns:
         Video tensor with shape [F, C, H, W] in range [0, 1] and frames per second (fps).
     """
-    with av.open(str(video_path)) as container:
-        video_stream = container.streams.video[0]
-        fps = float(video_stream.average_rate or video_stream.base_rate or 24)
-
-        frames = []
-        for frame in container.decode(video=0):
-            if max_frames is not None and len(frames) >= max_frames:
-                break
-            frames.append(frame.to_ndarray(format="rgb24"))
-
-    frames_np = np.stack(frames, axis=0)  # [F, H, W, C]
-    video = torch.from_numpy(frames_np).float().div(255.0)  # [F, H, W, C] in [0, 1]
-    return video.permute(0, 3, 1, 2), fps  # [F, C, H, W]
+    path = Path(video_path)
+    if _use_ffmpeg_decode(path):
+        return _read_video_ffmpeg(path, max_frames)
+    try:
+        return _read_video_pyav(path, max_frames)
+    except Exception as exc:
+        logger.debug("PyAV decode failed for %s (%s); falling back to ffmpeg", path, exc)
+        return _read_video_ffmpeg(path, max_frames)
 
 
 def save_video(
@@ -72,6 +130,9 @@ def save_video(
     audio: torch.Tensor | None = None,
     audio_sample_rate: int | None = None,
     video_format: VideoFormat | None = None,
+    *,
+    yuv_matrix: str | None = "bt709",
+    yuv_range: str | None = "limited",
 ) -> None:
     """Save a video tensor to a file using PyAV, optionally with audio.
     Args:
@@ -108,9 +169,15 @@ def save_video(
             audio_stream.layout = "stereo"
             audio_stream.time_base = Fraction(1, audio_sample_rate)
 
-        # Write video frames
+        from ltx_trainer.yuv_colorspace import YuvMatrix, YuvRange, rgb01_fhw_to_av_yuv420p_frame
+
+        matrix = YuvMatrix(yuv_matrix) if yuv_matrix else YuvMatrix.BT709
+        yrange = YuvRange(yuv_range) if yuv_range else YuvRange.LIMITED
+
+        # Write video frames (RGB uint8 → explicit yuv420p, then libx264 — ffmpeg-style path)
         for frame_array in video_np:
-            frame = av.VideoFrame.from_ndarray(frame_array, format="rgb24")
+            rgb01 = torch.from_numpy(frame_array).float().permute(2, 0, 1).div_(255.0)
+            frame = rgb01_fhw_to_av_yuv420p_frame(rgb01, matrix=matrix, yuv_range=yrange)
             for packet in video_stream.encode(frame):
                 container.mux(packet)
         for packet in video_stream.encode():
@@ -119,6 +186,22 @@ def save_video(
         # Write audio if provided
         if audio is not None:
             _write_audio(container, audio_stream, audio, audio_sample_rate)
+
+
+def save_video_ffmpeg(
+    video_tensor: torch.Tensor,
+    output_path: Path | str,
+    fps: float = 24.0,
+    video_format: VideoFormat | None = None,
+    *,
+    crf: int = 18,
+    preset: str = "medium",
+) -> None:
+    """Encode via :mod:`ltx_trainer.ffmpeg_io` (colorspace filter + libx264). No audio."""
+    from ltx_trainer.ffmpeg_io import write_rgb_video
+
+    video_np = _prepare_video_array(video_tensor, video_format=video_format)
+    write_rgb_video(video_np, output_path, fps=fps, crf=crf, preset=preset)
 
 
 def _prepare_video_array(

@@ -88,7 +88,9 @@ class MediaCaptioningModel(ABC):
     @staticmethod
     def _is_video_file(path: str | Path) -> bool:
         """Check if the file is a video based on extension."""
-        return str(path).lower().endswith((".mp4", ".avi", ".mov", ".mkv", ".webm"))
+        from ltx_trainer.media_formats import is_video_path
+
+        return is_video_path(path)
 
     @staticmethod
     def _clean_raw_caption(caption: str) -> str:

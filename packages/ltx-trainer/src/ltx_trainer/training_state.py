@@ -12,6 +12,7 @@ class ConfigFingerprint(BaseModel):
     training_mode: str
     lora_rank: int | None = None
     finetune_text_connectors: bool = False
+    finetune_text_stack: bool = False
 
 
 class RngStates(BaseModel):

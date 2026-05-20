@@ -15,6 +15,7 @@ Example usage:
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -22,6 +23,9 @@ from typing import TYPE_CHECKING
 import torch
 
 from ltx_trainer import logger
+from ltx_trainer.nvml_safe_cuda import apply_nvml_safe_cuda_patches
+
+apply_nvml_safe_cuda_patches()
 
 # Type alias for device specification
 Device = str | torch.device
@@ -319,6 +323,16 @@ def load_embeddings_processor(
                 )
             merged["ltx_checkpoint_text_flat_dim"] = flat_ck
             merged["ltx_experimental_flat_dim_bridge"] = True
+            allow_dense = os.environ.get("LTX_ALLOW_DENSE_FLAT_DIM_BRIDGE", "").lower() in ("1", "true", "yes")
+            if flat_dim_bridge_rank is None and not allow_dense:
+                default_rank = int(os.environ.get("LTX_DEFAULT_FLAT_DIM_BRIDGE_RANK", "32"))
+                flat_dim_bridge_rank = default_rank
+                logger.warning(
+                    "Gemma/LTX flat_dim mismatch and no flat_dim_bridge_rank set — defaulting to rank %s. "
+                    "Pass --flat-dim-bridge-rank explicitly or set LTX_ALLOW_DENSE_FLAT_DIM_BRIDGE=1 for the legacy "
+                    "dense random bridge (not recommended).",
+                    default_rank,
+                )
             if flat_dim_bridge_rank is not None:
                 merged["ltx_experimental_flat_dim_bridge_rank"] = int(flat_dim_bridge_rank)
             bridge_kind = (
@@ -328,9 +342,8 @@ def load_embeddings_processor(
             )
             logger.warning(
                 "Gemma encode flat_dim (%s) differs from LTX checkpoint video_aggregate_embed in_features (%s). "
-                "Using experimental flat_dim bridge: %s. Prefer matching Gemma/LTX geometry for fidelity. "
-                "Re-run scripts/process_captions.py with the same encoder + checkpoint after changes so "
-                "conditions/*.pt align; training applies connectors on top of those cached tensors.",
+                "Using experimental flat_dim bridge: %s. Re-run process_captions with the same encoder + checkpoint "
+                "after changes so conditions/*.pt align; training applies connectors on top of cached tensors.",
                 gemma_flat,
                 flat_ck,
                 bridge_kind,

@@ -1,5 +1,7 @@
 #!/usr/bin/env python
 
+import _kino_bootstrap  # noqa: F401  # must run before local ltx_trainer imports
+
 """
 Train LTXV models using configuration from YAML files.
 This script provides a command-line interface for training LTXV models using

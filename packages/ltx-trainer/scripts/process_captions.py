@@ -35,6 +35,7 @@ from transformers.utils.logging import disable_progress_bar
 
 from ltx_trainer import logger
 from ltx_trainer.model_loader import load_embeddings_processor, load_text_encoder
+from ltx_trainer.nvml_safe_cuda import apply_nvml_safe_cuda_patches, embeddings_processor_device
 
 # Disable tokenizers parallelism to avoid warnings
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -233,6 +234,8 @@ def compute_captions_embeddings(  # noqa: PLR0913
     device: str = "cuda",
     load_in_8bit: bool = False,
     flat_dim_bridge_rank: int | None = None,
+    skip_existing: bool = False,
+    embeddings_device: str | None = None,
 ) -> None:
     """
     Process captions and save text embeddings.
@@ -250,6 +253,8 @@ def compute_captions_embeddings(  # noqa: PLR0913
         load_in_8bit: Whether to load the Gemma text encoder in 8-bit precision
         flat_dim_bridge_rank: When Gemma/LTX flat_dim mismatch enables the experimental bridge, use this bottleneck
             rank (same as training YAML ``model.flat_dim_bridge_rank``); omit for dense bridge.
+        skip_existing: Skip captions whose output ``.pt`` already exists (resume interrupted runs).
+        embeddings_device: Device for LTX embeddings processor (defaults to ``device``; use ``cpu`` for dense bridge).
     """
 
     console = Console()
@@ -267,6 +272,26 @@ def compute_captions_embeddings(  # noqa: PLR0913
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
 
+    apply_nvml_safe_cuda_patches()
+    proc_device = embeddings_processor_device(embeddings_device or device)
+    if (
+        embeddings_device is None
+        and flat_dim_bridge_rank is None
+        and os.environ.get("LTX_ALLOW_DENSE_FLAT_DIM_BRIDGE", "").lower() in ("1", "true", "yes")
+    ):
+        proc_device = "cpu"
+        logger.warning(
+            "Dense flat_dim bridge: loading embeddings processor on CPU (~30GB GPU avoided). "
+            "Gemma stays on %s; encoding is slower but fits alongside other GPU jobs.",
+            device,
+        )
+    elif proc_device == "cpu" and str(device).startswith("cuda"):
+        logger.warning(
+            "Broken NVML / driver mismatch: embeddings processor on CPU (Gemma on %s). "
+            "Caption encode is slower but avoids CUDACachingAllocator NVML crashes.",
+            device,
+        )
+
     # Load text encoder and embeddings processor
     with console.status("[bold]Loading Gemma text encoder...", spinner="dots"):
         text_encoder = load_text_encoder(
@@ -277,7 +302,7 @@ def compute_captions_embeddings(  # noqa: PLR0913
         )
         embeddings_processor = load_embeddings_processor(
             model_path,
-            device=device,
+            device=proc_device,
             dtype=torch.bfloat16,
             gemma_model_path=text_encoder_path,
             flat_dim_bridge_rank=flat_dim_bridge_rank,
@@ -298,6 +323,9 @@ def compute_captions_embeddings(  # noqa: PLR0913
 
     # Process batches
     total_batches = len(dataloader)
+    skipped = 0
+    if skip_existing:
+        logger.info("skip_existing enabled — shards with an existing output .pt will be skipped")
     logger.info(f"Processing captions in {total_batches:,} batches...")
 
     with Progress(
@@ -319,17 +347,24 @@ def compute_captions_embeddings(  # noqa: PLR0913
                 # TODO(batch-tokenization): When tokenizer supports batching, encode all prompts at once.
                 # For now, process one at a time:
                 for i in range(len(batch["prompt"])):
-                    hidden_states, prompt_attention_mask = text_encoder.encode(batch["prompt"][i], padding_side="left")
-                    video_prompt_embeds, audio_prompt_embeds = embeddings_processor.feature_extractor(
-                        hidden_states, prompt_attention_mask, "left"
-                    )
-
                     output_rel_path = Path(batch["output_path"][i])
+                    output_file = output_path / output_rel_path
+                    if skip_existing and output_file.is_file() and output_file.stat().st_size > 0:
+                        skipped += 1
+                        continue
 
-                    # Create output directory maintaining structure
-                    output_dir_path = output_path / output_rel_path.parent
-                    output_dir_path.mkdir(parents=True, exist_ok=True)
+                    hidden_states, prompt_attention_mask = text_encoder.encode(batch["prompt"][i], padding_side="left")
+                    fe = embeddings_processor.feature_extractor
+                    fe_device = next(fe.parameters()).device
+                    # Gemma 4 encode() returns a tuple of layer hidden states, not a single tensor.
+                    if isinstance(hidden_states, (list, tuple)):
+                        hidden_states = tuple(h.to(fe_device) for h in hidden_states)
+                    else:
+                        hidden_states = hidden_states.to(fe_device)
+                    mask = prompt_attention_mask.to(fe_device)
+                    video_prompt_embeds, audio_prompt_embeds = fe(hidden_states, mask, "left")
 
+                    output_file.parent.mkdir(parents=True, exist_ok=True)
                     embedding_data = {
                         "video_prompt_embeds": video_prompt_embeds[0].cpu().contiguous(),
                         "prompt_attention_mask": prompt_attention_mask[0].cpu().contiguous(),
@@ -337,12 +372,14 @@ def compute_captions_embeddings(  # noqa: PLR0913
                     if audio_prompt_embeds is not None:
                         embedding_data["audio_prompt_embeds"] = audio_prompt_embeds[0].cpu().contiguous()
 
-                    output_file = output_path / output_rel_path
                     torch.save(embedding_data, output_file)
 
             progress.advance(task)
 
-    logger.info(f"Processed {len(dataset):,} captions. Embeddings saved to {output_path}")
+    msg = f"Processed {len(dataset):,} captions. Embeddings saved to {output_path}"
+    if skip_existing and skipped:
+        msg += f" ({skipped:,} skipped — already on disk)"
+    logger.info(msg)
 
 
 @app.command()
@@ -395,7 +432,11 @@ def main(  # noqa: PLR0913
     flat_dim_bridge_rank: int | None = typer.Option(
         default=None,
         help="If Gemma stacked width mismatches the LTX checkpoint, use low-rank experimental bridge with this rank "
-        "(must match training config; default: dense bridge)",
+        "(must match training config; defaults to rank 32 when omitted on mismatch)",
+    ),
+    skip_existing: bool = typer.Option(
+        default=False,
+        help="Skip items whose output .pt already exists (resume interrupted caption runs)",
     ),
 ) -> None:
     """Process text captions and save embeddings for video generation training.
@@ -439,6 +480,7 @@ def main(  # noqa: PLR0913
         device=device,
         load_in_8bit=load_text_encoder_in_8bit,
         flat_dim_bridge_rank=flat_dim_bridge_rank,
+        skip_existing=skip_existing,
     )
 
 

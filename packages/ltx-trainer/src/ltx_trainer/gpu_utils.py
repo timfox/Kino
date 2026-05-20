@@ -64,15 +64,48 @@ class free_gpu_memory_context:  # noqa: N801
         return wrapper  # type: ignore
 
 
+_nvml_available: bool | None = None
+
+
+def _gpu_memory_gb_torch(device: torch.device) -> float:
+    if not torch.cuda.is_available():
+        return 0.0
+    idx = device.index if device.index is not None else torch.cuda.current_device()
+    return torch.cuda.memory_allocated(idx) / 1024**3
+
+
 def get_gpu_memory_gb(device: torch.device) -> float:
-    """Get current GPU memory usage in GB using nvidia-smi.
-    Args:
-        device: torch.device to get memory usage for
-    Returns:
-        Current GPU memory usage in GB
-    """
+    """Return current GPU memory usage in GB (PyTorch allocator; NVML optional)."""
+    global _nvml_available
+    if not torch.cuda.is_available():
+        return 0.0
+    if _nvml_available is False:
+        return _gpu_memory_gb_torch(device)
+    if _nvml_available is None:
+        device_id = device.index if device.index is not None else torch.cuda.current_device()
+        try:
+            result = subprocess.check_output(
+                [
+                    "nvidia-smi",
+                    "--query-gpu=memory.used",
+                    "--format=csv,nounits,noheader",
+                    "-i",
+                    str(device_id),
+                ],
+                encoding="utf-8",
+                stderr=subprocess.DEVNULL,
+            )
+            _nvml_available = True
+            return float(result.strip()) / 1024  # MB → GB
+        except (subprocess.CalledProcessError, FileNotFoundError, ValueError) as e:
+            _nvml_available = False
+            logger.debug(
+                "nvidia-smi/NVML unavailable (%s); using torch.cuda.memory_allocated for GPU stats",
+                e,
+            )
+            return _gpu_memory_gb_torch(device)
+    device_id = device.index if device.index is not None else torch.cuda.current_device()
     try:
-        device_id = device.index if device.index is not None else 0
         result = subprocess.check_output(
             [
                 "nvidia-smi",
@@ -82,9 +115,9 @@ def get_gpu_memory_gb(device: torch.device) -> float:
                 str(device_id),
             ],
             encoding="utf-8",
+            stderr=subprocess.DEVNULL,
         )
-        return float(result.strip()) / 1024  # Convert MB to GB
-    except (subprocess.CalledProcessError, FileNotFoundError, ValueError) as e:
-        logger.error(f"Failed to get GPU memory from nvidia-smi: {e}")
-        # Fallback to torch
-        return torch.cuda.memory_allocated(device) / 1024**3
+        return float(result.strip()) / 1024
+    except (subprocess.CalledProcessError, FileNotFoundError, ValueError):
+        _nvml_available = False
+        return _gpu_memory_gb_torch(device)

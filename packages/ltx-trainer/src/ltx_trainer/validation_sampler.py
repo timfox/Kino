@@ -47,12 +47,17 @@ class CachedPromptEmbeddings:
     """Pre-computed text embeddings for a validation prompt.
     These embeddings are computed once at training start and reused for all validation runs,
     avoiding the need to load the full Gemma text encoder during validation.
+    When ``features_pre_connector`` is True, ``video_context_*`` / ``audio_context_*`` hold
+    feature_extractor outputs; ``ValidationSampler`` applies connectors at sample time.
     """
 
     video_context_positive: Tensor  # [1, seq_len, hidden_dim]
-    audio_context_positive: Tensor  # [1, seq_len, hidden_dim]
+    audio_context_positive: Tensor | None = None
     video_context_negative: Tensor | None = None
     audio_context_negative: Tensor | None = None
+    prompt_attention_mask_positive: Tensor | None = None
+    prompt_attention_mask_negative: Tensor | None = None
+    features_pre_connector: bool = False
 
 
 @dataclass
@@ -683,16 +688,53 @@ class ValidationSampler:
             raise ValueError("Either text_encoder or config.cached_embeddings must be provided")
         if config.cached_embeddings is None and self._embeddings_processor is None:
             raise ValueError("embeddings_processor is required when encoding prompts on-the-fly")
+        if (
+            config.cached_embeddings is not None
+            and config.cached_embeddings.features_pre_connector
+            and self._embeddings_processor is None
+        ):
+            raise ValueError("embeddings_processor is required when cached_embeddings.features_pre_connector is True")
+
+    def _apply_connectors_from_features(
+        self,
+        video_features: Tensor,
+        audio_features: Tensor | None,
+        attention_mask: Tensor,
+    ) -> tuple[Tensor, Tensor | None, Tensor | None, Tensor | None]:
+        from ltx_core.text_encoders.gemma import convert_to_additive_mask
+
+        additive_mask = convert_to_additive_mask(attention_mask, video_features.dtype)
+        video_embeds, audio_embeds, _ = self._embeddings_processor.create_embeddings(
+            video_features, audio_features, additive_mask
+        )
+        return video_embeds, audio_embeds, None, None
 
     def _get_prompt_embeddings(
         self, config: GenerationConfig, device: torch.device
     ) -> tuple[Tensor, Tensor, Tensor | None, Tensor | None]:
         """Get prompt embeddings from config cache or encode on-the-fly."""
         if config.cached_embeddings is not None:
-            # Use pre-computed embeddings from config
             cached = config.cached_embeddings
+            if cached.features_pre_connector:
+                self._embeddings_processor.to(device)
+                v_pos, a_pos, _, _ = self._apply_connectors_from_features(
+                    cached.video_context_positive.to(device),
+                    cached.audio_context_positive.to(device) if cached.audio_context_positive is not None else None,
+                    cached.prompt_attention_mask_positive.to(device),
+                )
+                v_neg, a_neg = None, None
+                if config.guidance_scale != 1.0 and cached.video_context_negative is not None:
+                    v_neg, a_neg, _, _ = self._apply_connectors_from_features(
+                        cached.video_context_negative.to(device),
+                        cached.audio_context_negative.to(device) if cached.audio_context_negative is not None else None,
+                        cached.prompt_attention_mask_negative.to(device),
+                    )
+                return v_pos, a_pos, v_neg, a_neg
+
             v_ctx_pos = cached.video_context_positive.to(device)
-            a_ctx_pos = cached.audio_context_positive.to(device)
+            a_ctx_pos = (
+                cached.audio_context_positive.to(device) if cached.audio_context_positive is not None else v_ctx_pos
+            )
             v_ctx_neg = cached.video_context_negative.to(device) if cached.video_context_negative is not None else None
             a_ctx_neg = cached.audio_context_negative.to(device) if cached.audio_context_negative is not None else None
             return v_ctx_pos, a_ctx_pos, v_ctx_neg, a_ctx_neg

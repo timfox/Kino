@@ -66,6 +66,25 @@ class ModelConfig(ConfigBaseModel):
         "still use the initial connector weights unless you disable that cache.",
     )
 
+    finetune_text_stack: bool = Field(
+        default=False,
+        description="Train feature_extractor (flat_dim bridge + video/audio aggregate linears). Keeps feature_extractor "
+        "on GPU; with text_stack_live_captions runs Gemma encode() each step. Saved as text_stack_weights_step_*.safetensors. "
+        "Use text_stack_freeze_dit for Phase 1a (frozen DiT).",
+    )
+
+    text_stack_freeze_dit: bool = Field(
+        default=True,
+        description="When finetune_text_stack is true, do not train the diffusion transformer (Phase 1a). Set false to "
+        "jointly train LoRA/full DiT and the text stack.",
+    )
+
+    text_stack_live_captions: bool = Field(
+        default=True,
+        description="When finetune_text_stack is true, load captions from data.dataset_manifest_path and run the full "
+        "Gemma → feature_extractor → connector path each step (required to train bridge/aggregates).",
+    )
+
     @field_validator("model_path")
     @classmethod
     def validate_model_path(cls, v: str | Path) -> str | Path:
@@ -222,6 +241,12 @@ class DataConfig(ConfigBaseModel):
         default=2,
         description="Number of background processes for data loading (0 means synchronous loading)",
         ge=0,
+    )
+
+    dataset_manifest_path: str | Path | None = Field(
+        default=None,
+        description="dataset.json (or CSV/JSONL) with caption + media_path. Required when model.finetune_text_stack and "
+        "model.text_stack_live_captions are enabled; used to align captions with precomputed latent shards.",
     )
 
 
@@ -568,5 +593,16 @@ class LtxTrainerConfig(ConfigBaseModel):
         # Check that LoRA config is provided when using video_to_video strategy
         if self.training_strategy.name == "video_to_video" and self.model.training_mode != "lora":
             raise ValueError("Training mode must be 'lora' when using video_to_video strategy")
+
+        if self.model.finetune_text_stack:
+            if not self.model.text_encoder_path:
+                raise ValueError("model.text_encoder_path is required when model.finetune_text_stack is true")
+            if self.model.text_stack_live_captions and not self.data.dataset_manifest_path:
+                raise ValueError(
+                    "data.dataset_manifest_path is required when finetune_text_stack and text_stack_live_captions "
+                    "are enabled"
+                )
+            if self.model.text_stack_freeze_dit and self.model.training_mode == "full":
+                raise ValueError("text_stack_freeze_dit cannot be used with training_mode 'full'")
 
         return self

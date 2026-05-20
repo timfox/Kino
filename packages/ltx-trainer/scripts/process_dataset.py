@@ -12,10 +12,11 @@ Basic usage:
 The dataset must be a CSV, JSON, or JSONL file with columns for captions and video paths.
 """
 
+import _kino_bootstrap  # noqa: F401  # must run before local / ltx_trainer imports
+
 from pathlib import Path
 
 import typer
-from decode_latents import LatentsDecoder
 from process_captions import compute_captions_embeddings
 from process_videos import (
     _ALLOWED_HDR_TRANSFER,
@@ -64,6 +65,9 @@ def preprocess_dataset(  # noqa: PLR0913
     hdr_synth_bracket_ev: str | None = None,
     hdr_vae_encoding: str = "reinhard",
     latent_save_dtype: str = "float32",
+    skip_existing: bool = False,
+    captions_only: bool = False,
+    latents_only: bool = False,
 ) -> None:
     """Run the preprocessing pipeline with the given arguments."""
     # Validate dataset file
@@ -98,25 +102,53 @@ def preprocess_dataset(  # noqa: PLR0913
     conditions_dir = output_base / "conditions"
     latents_dir = output_base / "latents"
 
+    if captions_only and latents_only:
+        raise ValueError("Use at most one of captions_only or latents_only")
+
     if lora_trigger:
         logger.info(f'LoRA trigger word "{lora_trigger}" will be prepended to all captions')
 
-    with free_gpu_memory_context():
-        # Process captions using the dedicated function
-        compute_captions_embeddings(
-            dataset_file=dataset_file,
-            output_dir=str(conditions_dir),
+    if not latents_only:
+        with free_gpu_memory_context():
+            # Process captions using the dedicated function
+            compute_captions_embeddings(
+                dataset_file=dataset_file,
+                output_dir=str(conditions_dir),
+                model_path=model_path,
+                text_encoder_path=text_encoder_path,
+                caption_column=caption_column,
+                media_column=video_column,
+                lora_trigger=lora_trigger,
+                remove_llm_prefixes=remove_llm_prefixes,
+                batch_size=batch_size,
+                device=device,
+                load_in_8bit=load_text_encoder_in_8bit,
+                flat_dim_bridge_rank=flat_dim_bridge_rank,
+                skip_existing=skip_existing,
+            )
+
+    if captions_only:
+        import os
+
+        from ltx_trainer.preprocess_meta import write_preprocess_meta
+
+        effective_bridge_rank = flat_dim_bridge_rank
+        if effective_bridge_rank is None and os.environ.get("LTX_ALLOW_DENSE_FLAT_DIM_BRIDGE", "").lower() not in (
+            "1",
+            "true",
+            "yes",
+        ):
+            effective_bridge_rank = int(os.environ.get("LTX_DEFAULT_FLAT_DIM_BRIDGE_RANK", "32"))
+        write_preprocess_meta(
+            output_base,
             model_path=model_path,
             text_encoder_path=text_encoder_path,
-            caption_column=caption_column,
-            media_column=video_column,
-            lora_trigger=lora_trigger,
-            remove_llm_prefixes=remove_llm_prefixes,
-            batch_size=batch_size,
-            device=device,
-            load_in_8bit=load_text_encoder_in_8bit,
-            flat_dim_bridge_rank=flat_dim_bridge_rank,
+            flat_dim_bridge_rank=effective_bridge_rank,
+            dataset_file=dataset_file,
+            resolution_buckets=resolution_buckets,
         )
+        logger.info(f"Captions-only preprocess complete. Results under {output_base}")
+        return
 
     # Process videos using the dedicated function
     audio_latents_dir = None
@@ -141,6 +173,7 @@ def preprocess_dataset(  # noqa: PLR0913
             hdr_synth_bracket_ev=hdr_synth_bracket_ev,
             hdr_vae_encoding=hve,
             latent_save_dtype=latent_dtype,
+            skip_existing=skip_existing,
         )
 
         # Process reference videos if reference_column is provided
@@ -182,10 +215,13 @@ def preprocess_dataset(  # noqa: PLR0913
                 hdr_synth_bracket_ev=hdr_synth_bracket_ev,
                 hdr_vae_encoding=hve,
                 latent_save_dtype=latent_dtype,
+                skip_existing=skip_existing,
             )
 
     # Handle decoding if requested (for verification)
     if decode:
+        from decode_latents import LatentsDecoder
+
         logger.info("Decoding latents for verification...")
 
         decoder = LatentsDecoder(
@@ -207,6 +243,27 @@ def preprocess_dataset(  # noqa: PLR0913
         if with_audio and audio_latents_dir and audio_latents_dir.exists():
             logger.info("Decoding audio latents...")
             decoder.decode_audio(audio_latents_dir, output_base / "decoded_audio")
+
+    import os
+
+    from ltx_trainer.preprocess_meta import write_preprocess_meta
+
+    effective_bridge_rank = flat_dim_bridge_rank
+    if effective_bridge_rank is None and os.environ.get("LTX_ALLOW_DENSE_FLAT_DIM_BRIDGE", "").lower() not in (
+        "1",
+        "true",
+        "yes",
+    ):
+        effective_bridge_rank = int(os.environ.get("LTX_DEFAULT_FLAT_DIM_BRIDGE_RANK", "32"))
+
+    write_preprocess_meta(
+        output_base,
+        model_path=model_path,
+        text_encoder_path=text_encoder_path,
+        flat_dim_bridge_rank=effective_bridge_rank,
+        dataset_file=dataset_file,
+        resolution_buckets=resolution_buckets,
+    )
 
     # Print summary
     logger.info(f"Dataset preprocessing complete! Results saved to {output_base}")
@@ -299,7 +356,24 @@ def main(  # noqa: PLR0913
     flat_dim_bridge_rank: int | None = typer.Option(
         default=None,
         help="When Gemma stacked width mismatches the LTX checkpoint, use low-rank experimental bridge with this rank "
-        "(must match training YAML model.flat_dim_bridge_rank; see tools/LTX_TRAINER.md §6 in GopexLLC).",
+        "(must match training YAML model.flat_dim_bridge_rank; default 32 when omitted — see tools/LTX_TRAINER.md §6).",
+    ),
+    allow_dense_bridge: bool = typer.Option(
+        default=False,
+        help="Allow legacy dense random flat_dim bridge on mismatch (not recommended; sets "
+        "LTX_ALLOW_DENSE_FLAT_DIM_BRIDGE for caption embed only).",
+    ),
+    skip_existing: bool = typer.Option(
+        default=False,
+        help="Skip caption/latent shards that already exist on disk (resume interrupted preprocess)",
+    ),
+    captions_only: bool = typer.Option(
+        default=False,
+        help="Only embed captions (no VAE latents). Skips Gemma if combined with latents-only on a second run.",
+    ),
+    latents_only: bool = typer.Option(
+        default=False,
+        help="Only encode video latents (no Gemma / embeddings processor). Use when conditions/ are already complete.",
     ),
     reference_downscale_factor: int = typer.Option(
         default=1,
@@ -378,6 +452,11 @@ def main(  # noqa: PLR0913
     if hve != "reinhard" and not hdr_ingest:
         raise typer.BadParameter("--hdr-vae-encoding pu21, logc3, or lf_log1p requires --hdr-ingest")
 
+    import os
+
+    if allow_dense_bridge:
+        os.environ["LTX_ALLOW_DENSE_FLAT_DIM_BRIDGE"] = "1"
+
     preprocess_dataset(
         dataset_file=dataset_path,
         caption_column=caption_column,
@@ -402,6 +481,9 @@ def main(  # noqa: PLR0913
         hdr_synth_bracket_ev=hdr_synth_bracket_ev,
         hdr_vae_encoding=hve,
         latent_save_dtype=latent_save_dtype,
+        skip_existing=skip_existing,
+        captions_only=captions_only,
+        latents_only=latents_only,
     )
 
 

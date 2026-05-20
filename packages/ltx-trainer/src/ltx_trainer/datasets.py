@@ -105,7 +105,13 @@ class DummyDataset(Dataset):
 
 
 class PrecomputedDataset(Dataset):
-    def __init__(self, data_root: str, data_sources: dict[str, str] | list[str] | None = None) -> None:
+    def __init__(
+        self,
+        data_root: str,
+        data_sources: dict[str, str] | list[str] | None = None,
+        *,
+        caption_index: dict[str, str] | None = None,
+    ) -> None:
         """
         Generic dataset for loading precomputed data from multiple sources.
         Args:
@@ -129,9 +135,12 @@ class PrecomputedDataset(Dataset):
 
         self.data_root = self._setup_data_root(data_root)
         self.data_sources = self._normalize_data_sources(data_sources)
+        self.caption_index = caption_index or {}
         self.source_paths = self._setup_source_paths()
         self.sample_files = self._discover_samples()
         self._validate_setup()
+        if self.caption_index:
+            self._validate_caption_coverage()
 
     @staticmethod
     def _setup_data_root(data_root: str) -> Path:
@@ -373,6 +382,40 @@ class PrecomputedDataset(Dataset):
 
         return source_paths
 
+    @staticmethod
+    def _prune_legacy_flat_latent_shards(data_files: list[Path], data_path: Path) -> list[Path]:
+        """Drop orphan ``latents/data/*.pt`` when manifest-aligned ``<project>/data/clips/`` exists.
+
+        Older preprocess runs wrote flat shards under ``latents/data/``; newer runs mirror
+        ``ltx_manifest`` paths under ``latents/<dataset>/data/clips/``. Keeping both makes
+        indexing scan ~1.9k files that can never pair with ``conditions/`` and floods logs.
+        """
+        legacy_dir = data_path / "data"
+        if not legacy_dir.is_dir():
+            return data_files
+        canonical_roots = [
+            p
+            for p in data_path.iterdir()
+            if p.is_dir() and p.name != "data" and (p / "data" / "clips").is_dir()
+        ]
+        if not canonical_roots:
+            return data_files
+        legacy_set = {p.resolve() for p in data_files if p.parent.resolve() == legacy_dir.resolve()}
+        if not legacy_set:
+            return data_files
+        kept = [p for p in data_files if p.resolve() not in legacy_set]
+        dropped = len(data_files) - len(kept)
+        if dropped:
+            example = canonical_roots[0].name
+            logger.info(
+                "Excluded %d legacy flat latent shard(s) under %s "
+                "(paired tensors live under %s/data/clips/).",
+                dropped,
+                legacy_dir.relative_to(data_path),
+                example,
+            )
+        return kept
+
     def _discover_samples(self) -> dict[str, list[Path]]:
         """Discover all valid sample files across all data sources.
         Uses a fast two-pass approach: first globs all sources in parallel to build
@@ -406,6 +449,8 @@ class PrecomputedDataset(Dataset):
         data_files, _ = glob_results[data_key]
         if not data_files:
             raise ValueError(f"No data files found in {data_path}")
+        if data_key == "latents":
+            data_files = self._prune_legacy_flat_latent_shards(data_files, data_path)
         data_files.sort()
 
         # Log source sizes
@@ -429,7 +474,6 @@ class PrecomputedDataset(Dataset):
             for dir_name, path_set in other_path_sets.items():
                 expected = self._get_expected_file_path(dir_name, data_file, rel_path)
                 if str(expected) not in path_set:
-                    logger.debug(f"Skipping {data_file.name}: no matching {dir_name} file at {expected}")
                     all_exist = False
                     break
 
@@ -460,6 +504,24 @@ class PrecomputedDataset(Dataset):
         for dir_name, output_key in self.data_sources.items():
             expected_path = self._get_expected_file_path(dir_name, data_file, rel_path)
             sample_files[output_key].append(expected_path.relative_to(self.source_paths[dir_name]))
+
+    def _validate_caption_coverage(self) -> None:
+        """Ensure every latent shard has a caption when live text-stack training is enabled."""
+        first_key = next(iter(self.sample_files.keys()))
+        latent_key = "latent_conditions" if "latent_conditions" in self.sample_files else first_key
+        missing: list[str] = []
+        check_n = len(self.sample_files[latent_key])
+        for rel in self.sample_files[latent_key][:check_n]:
+            from ltx_trainer.text_stack_utils import caption_keys_for_tensor_path
+
+            if not any(k in self.caption_index for k in caption_keys_for_tensor_path(rel)):
+                missing.append(str(rel))
+        if missing:
+            raise ValueError(
+                f"Caption index missing {len(missing)}+ samples (first: {missing[0]}). "
+                "Check data.dataset_manifest_path aligns with precomputed latent paths."
+            )
+        logger.info("Caption index: %s entries, aligned with precomputed samples", len(self.caption_index))
 
     def _validate_setup(self) -> None:
         """Validate that the dataset setup is correct."""
@@ -497,6 +559,23 @@ class PrecomputedDataset(Dataset):
                 result[output_key] = data
             except Exception as e:
                 raise RuntimeError(f"Failed to load {output_key} from {file_path}: {e}") from e
+
+        if self.caption_index:
+            from ltx_trainer.text_stack_utils import caption_keys_for_tensor_path
+
+            latent_rel = self.sample_files.get("latent_conditions", self.sample_files[next(iter(self.sample_files))])[
+                index
+            ]
+            caption = None
+            for cap_key in caption_keys_for_tensor_path(latent_rel):
+                caption = self.caption_index.get(cap_key)
+                if caption is not None:
+                    break
+            if caption is None:
+                raise KeyError(
+                    f"No caption for latent {latent_rel!r} (tried keys {caption_keys_for_tensor_path(latent_rel)})"
+                )
+            result["caption"] = caption
 
         # Add index for debugging
         result["idx"] = index
