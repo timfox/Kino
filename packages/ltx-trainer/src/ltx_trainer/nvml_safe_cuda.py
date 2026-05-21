@@ -141,11 +141,21 @@ def _patch_torch_cuda_mem_get_info() -> None:
     cuda.mem_get_info = mem_get_info  # type: ignore[method-assign]
 
 
+def resolve_gopex_cuda_device(env_key: str, fallback: str | int) -> str:
+    """Parse ``GOPEX_*_CUDA_DEVICE`` (index or ``cuda:N``) for multi-GPU placement."""
+    raw = os.environ.get(env_key, "").strip()
+    if not raw:
+        return str(fallback)
+    if raw.isdigit():
+        return f"cuda:{raw}"
+    return raw
+
+
 def embeddings_processor_device(preferred: str) -> str:
     """Where to load LTX ``EmbeddingsProcessor`` during caption encode / validation cache."""
     if _nvml_safe_forced() or not nvidia_smi_ok():
         return "cpu"
-    return preferred
+    return resolve_gopex_cuda_device("GOPEX_CONNECTOR_CUDA_DEVICE", preferred)
 
 
 def move_gemma_encode_outputs_to_device(

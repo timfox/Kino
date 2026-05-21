@@ -38,7 +38,11 @@ from ltx_trainer.datasets import PrecomputedDataset
 from ltx_trainer.gpu_utils import free_gpu_memory, free_gpu_memory_context, get_gpu_memory_gb
 from ltx_trainer.hf_hub_utils import push_to_hub
 from ltx_trainer.model_loader import load_embeddings_processor, load_text_encoder
-from ltx_trainer.nvml_safe_cuda import embeddings_processor_device, move_gemma_encode_outputs_to_device
+from ltx_trainer.nvml_safe_cuda import (
+    embeddings_processor_device,
+    move_gemma_encode_outputs_to_device,
+    resolve_gopex_cuda_device,
+)
 from ltx_trainer.model_loader import load_model as load_ltx_model
 from ltx_trainer.progress import TrainingProgress
 from ltx_trainer.quantization import quantize_model
@@ -429,6 +433,39 @@ class LtxvTrainer:
 
         return saved_path, stats
 
+    def _connector_device(self) -> torch.device:
+        """DiT stays on the Accelerate device; optional ``GOPEX_CONNECTOR_CUDA_DEVICE`` offloads connectors."""
+        train_dev = self._accelerator.device
+        if not torch.cuda.is_available() or self._embeddings_processor is None:
+            return train_dev
+        conn = resolve_gopex_cuda_device("GOPEX_CONNECTOR_CUDA_DEVICE", train_dev)
+        return torch.device(conn)
+
+    def _apply_text_connectors(
+        self,
+        video_features: Tensor,
+        audio_features: Tensor | None,
+        prompt_mask: Tensor,
+    ) -> tuple[Tensor, Tensor | None, Tensor]:
+        """Run frozen/trainable connectors; handles cross-GPU when ``GOPEX_CONNECTOR_CUDA_DEVICE`` is set."""
+        train_dev = self._accelerator.device
+        conn_dev = self._connector_device()
+        additive_mask = convert_to_additive_mask(prompt_mask, video_features.dtype)
+        if conn_dev != train_dev:
+            video_features = video_features.to(conn_dev)
+            if audio_features is not None:
+                audio_features = audio_features.to(conn_dev)
+            additive_mask = additive_mask.to(conn_dev)
+        video_embeds, audio_embeds, attention_mask = self._embeddings_processor.create_embeddings(
+            video_features, audio_features, additive_mask
+        )
+        if conn_dev != train_dev:
+            video_embeds = video_embeds.to(train_dev)
+            if audio_embeds is not None:
+                audio_embeds = audio_embeds.to(train_dev)
+            attention_mask = attention_mask.to(train_dev)
+        return video_embeds, audio_embeds, attention_mask
+
     def _training_step(self, batch: dict[str, dict[str, Tensor]]) -> TrainingStepOutput:
         """Perform a single training step using the configured strategy."""
         conditions = batch["conditions"]
@@ -447,9 +484,8 @@ class LtxvTrainer:
                 audio_features = conditions["prompt_embeds"]
 
             mask = conditions["prompt_attention_mask"]
-            additive_mask = convert_to_additive_mask(mask, video_features.dtype)
-            video_embeds, audio_embeds, attention_mask = self._embeddings_processor.create_embeddings(
-                video_features, audio_features, additive_mask
+            video_embeds, audio_embeds, attention_mask = self._apply_text_connectors(
+                video_features, audio_features, mask
             )
             conditions["video_prompt_embeds"] = video_embeds
             conditions["audio_prompt_embeds"] = audio_embeds
@@ -839,13 +875,19 @@ class LtxvTrainer:
         logger.info("Loaded text stack weights from %s", sidecar)
 
     def _maybe_load_text_embed_connector_checkpoint(self, main_checkpoint: Path) -> None:
-        if not self._config.model.finetune_text_connectors:
-            return
         sidecar = _text_embed_sidecar_path(main_checkpoint)
         if not sidecar.is_file():
+            if self._config.model.finetune_text_connectors:
+                logger.warning(
+                    "finetune_text_connectors is enabled but no sidecar at %s — connectors stay at init weights",
+                    sidecar,
+                )
             return
         _load_text_connector_sidecar(self._embeddings_processor, sidecar)
-        logger.info("Loaded text connector weights from %s", sidecar)
+        if self._config.model.finetune_text_connectors:
+            logger.info("Loaded text connector weights from %s", sidecar)
+        else:
+            logger.info("Loaded frozen text connector weights from %s (LoRA-only training)", sidecar)
 
     def _resolve_resume_state(self) -> tuple[int, TrainingState | None]:
         """Determine resume state by looking for a training state file next to the loaded checkpoint.
@@ -970,13 +1012,19 @@ class LtxvTrainer:
             self._vae_encoder = self._vae_encoder.to("cpu")
 
         if self._embeddings_processor is not None and torch.cuda.is_available():
-            train_dev = self._accelerator.device
-            self._embeddings_processor.video_connector.to(train_dev)
+            conn_dev = self._connector_device()
+            self._embeddings_processor.video_connector.to(conn_dev)
             if self._embeddings_processor.audio_connector is not None:
-                self._embeddings_processor.audio_connector.to(train_dev)
+                self._embeddings_processor.audio_connector.to(conn_dev)
             fe = self._embeddings_processor.feature_extractor
             if fe is not None:
-                fe.to(train_dev)
+                fe.to(conn_dev)
+            if conn_dev != self._accelerator.device:
+                logger.info(
+                    "Text connectors on %s; DiT LoRA on %s (GOPEX_CONNECTOR_CUDA_DEVICE)",
+                    conn_dev,
+                    self._accelerator.device,
+                )
 
         # noinspection PyTypeChecker
         self._transformer = self._accelerator.prepare(self._transformer)
@@ -1065,12 +1113,19 @@ class LtxvTrainer:
         opt_cfg = self._config.optimization
 
         lr = opt_cfg.learning_rate
+        n_trainable = sum(p.numel() for p in self._trainable_params)
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
         if opt_cfg.optimizer_type == "adamw":
             optimizer = AdamW(self._trainable_params, lr=lr)
         elif opt_cfg.optimizer_type == "adamw8bit":
             # noinspection PyUnresolvedReferences
             from bitsandbytes.optim import AdamW8bit  # noqa: PLC0415
 
+            logger.info(
+                "Using AdamW8bit for %s trainable parameters (saves VRAM vs full Adam state)",
+                f"{n_trainable:,}",
+            )
             optimizer = AdamW8bit(self._trainable_params, lr=lr)
         else:
             raise ValueError(f"Unknown optimizer type: {opt_cfg.optimizer_type}")
