@@ -174,24 +174,10 @@ echo "=== 4–5) Preprocess all datasets + audit ==="
 _run_batch_preprocess
 
 if [[ "${RUN_PHASE2_TRAIN:-0}" == "1" ]]; then
-  echo "=== 6) Phase 2 LoRA (resume from 6k → 12k on PRECOMPUTED_ROOT) ==="
-  PHASE2_CFG="$PHASE2_RUN/train.yaml"
-  mkdir -p "$PHASE2_RUN"
-  if [[ "$GEMMA_PROFILE" == "gemma31b" ]]; then
-    cp "$TRAINER/configs/ltx2_av_lora_gemma4_31b_bridge512_connectors.yaml" "$PHASE2_CFG"
-  else
-    cp "$TRAINER/configs/ltx2_av_lora_gemma4_bridge_connectors.yaml" "$PHASE2_CFG"
-  fi
-  sed -i \
-    -e "s|load_checkpoint:.*|load_checkpoint: ${LORA_CKPT}|" \
-    -e "s|preprocessed_data_root:.*|preprocessed_data_root: ${PRECOMPUTED_ROOT}|" \
-    -e 's|steps: 6000|steps: 12000|' \
-    -e "s|output_dir:.*|output_dir: ${PHASE2_RUN}|" \
-    "$PHASE2_CFG"
-  cd "$TRAINER"
-  python scripts/train.py "$PHASE2_CFG" 2>&1 | tee "$WORK_ROOT/logs/phase2-train.log"
+  echo "=== 6) Phase 2 LoRA (merged precompute, warm-start 6k LoRA) ==="
+  bash "$GOPEX_REPO/scripts/kino-phase2-train.sh"
 else
-  echo "=== 6) Skipping Phase 2 train (set RUN_PHASE2_TRAIN=1 after preprocess finishes) ==="
+  echo "=== 6) Skipping Phase 2 train (./scripts/kino-phase2-train.sh or RUN_PHASE2_TRAIN=1) ==="
 fi
 
 # ── OPTIONAL: Phase 1a text stack (bridge + aggregates, frozen DiT) ─────────

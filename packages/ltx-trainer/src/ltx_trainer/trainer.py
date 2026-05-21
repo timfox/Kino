@@ -38,6 +38,7 @@ from ltx_trainer.datasets import PrecomputedDataset
 from ltx_trainer.gpu_utils import free_gpu_memory, free_gpu_memory_context, get_gpu_memory_gb
 from ltx_trainer.hf_hub_utils import push_to_hub
 from ltx_trainer.model_loader import load_embeddings_processor, load_text_encoder
+from ltx_trainer.nvml_safe_cuda import embeddings_processor_device, move_gemma_encode_outputs_to_device
 from ltx_trainer.model_loader import load_model as load_ltx_model
 from ltx_trainer.progress import TrainingProgress
 from ltx_trainer.quantization import quantize_model
@@ -154,6 +155,7 @@ class TrainingStepOutput:
 class LtxvTrainer:
     def __init__(self, trainer_config: LtxTrainerConfig) -> None:
         self._config = trainer_config
+        self._exposure_head = None
         if IS_MAIN_PROCESS:
             print_config(trainer_config)
         self._training_strategy = get_training_strategy(self._config.training_strategy)
@@ -172,7 +174,6 @@ class LtxvTrainer:
         self._training_state_size_warned = False
         self._wandb_run = None
         self._sigma_tracker = SigmaBucketTracker()
-        self._exposure_head = None
 
         if self._config.model.finetune_text_connectors and self._config.validation.prompts:
             if self._cached_validation_embeddings and not all(
@@ -496,8 +497,12 @@ class LtxvTrainer:
         audio_parts: list[Tensor] = []
         mask_parts: list[Tensor] = []
 
+        proc_device = str(self._accelerator.device)
         for caption in captions:
             hidden_states, prompt_mask = self._text_encoder.encode(caption, padding_side="left")
+            hidden_states, prompt_mask = move_gemma_encode_outputs_to_device(
+                hidden_states, prompt_mask, proc_device
+            )
             out = self._embeddings_processor.process_hidden_states(hidden_states, prompt_mask, "left")
             video_parts.append(out.video_encoding)
             mask_parts.append(out.attention_mask)
@@ -519,11 +524,18 @@ class LtxvTrainer:
         #   3. If validation prompts are configured, computes and caches their embeddings
         #   4. Unloads the Gemma model entirely, keeps the embeddings processor for training
 
-        # Load text encoder (pure Gemma LLM) on GPU
+        startup_device = embeddings_processor_device("cuda")
+        if startup_device == "cpu":
+            logger.info(
+                "NVML-safe mode: Gemma + embeddings processor on CPU for validation cache; "
+                "connectors move to training GPU after model prep."
+            )
+
+        # Load text encoder (pure Gemma LLM)
         logger.debug("Loading text encoder...")
         text_encoder = load_text_encoder(
             gemma_model_path=self._config.model.text_encoder_path,
-            device="cuda",
+            device=startup_device,
             dtype=torch.bfloat16,
             load_in_8bit=self._config.acceleration.load_text_encoder_in_8bit,
         )
@@ -532,7 +544,7 @@ class LtxvTrainer:
         logger.debug("Loading embeddings processor...")
         self._embeddings_processor = load_embeddings_processor(
             checkpoint_path=self._config.model.model_path,
-            device="cuda",
+            device=startup_device,
             dtype=torch.bfloat16,
             gemma_model_path=self._config.model.text_encoder_path,
             gemma_encode_stack_dims=(
@@ -552,6 +564,8 @@ class LtxvTrainer:
                 for prompt in self._config.validation.prompts:
                     pos_hs, pos_mask = text_encoder.encode(prompt)
                     neg_hs, neg_mask = text_encoder.encode(self._config.validation.negative_prompt)
+                    pos_hs, pos_mask = move_gemma_encode_outputs_to_device(pos_hs, pos_mask, startup_device)
+                    neg_hs, neg_mask = move_gemma_encode_outputs_to_device(neg_hs, neg_mask, startup_device)
                     if cache_pre_connector:
                         pos_v, pos_a = self._embeddings_processor.feature_extractor(pos_hs, pos_mask, "left")
                         neg_v, neg_a = self._embeddings_processor.feature_extractor(neg_hs, neg_mask, "left")
@@ -723,6 +737,7 @@ class LtxvTrainer:
     def _setup_latenthdr(self) -> None:
         """Load optional LatentHDR exposure head for joint L_ev."""
         if not self._config.latenthdr.enabled:
+            self._exposure_head = None
             return
         from ltx_trainer.latenthdr import FiLMResidualExposureHead, load_exposure_head_from_checkpoint
 
@@ -954,12 +969,19 @@ class LtxvTrainer:
         if self._vae_encoder is not None:
             self._vae_encoder = self._vae_encoder.to("cpu")
 
-        # Embedding connectors are already on GPU from _load_text_encoder_and_cache_embeddings
+        if self._embeddings_processor is not None and torch.cuda.is_available():
+            train_dev = self._accelerator.device
+            self._embeddings_processor.video_connector.to(train_dev)
+            if self._embeddings_processor.audio_connector is not None:
+                self._embeddings_processor.audio_connector.to(train_dev)
+            fe = self._embeddings_processor.feature_extractor
+            if fe is not None:
+                fe.to(train_dev)
 
         # noinspection PyTypeChecker
         self._transformer = self._accelerator.prepare(self._transformer)
 
-        if self._exposure_head is not None:
+        if self._config.latenthdr.enabled and self._exposure_head is not None:
             self._exposure_head = self._exposure_head.to(self._accelerator.device)
             if not self._config.latenthdr.train_exposure_head:
                 self._exposure_head.eval()

@@ -1,5 +1,7 @@
 # Gemma 4 + LTX 2.3 — best quality path
 
+**Weight types and file naming:** [documents/LTX_WEIGHTS.md](../../../../documents/LTX_WEIGHTS.md) (Gopex repo root).
+
 Use **bridge rank 512** (highest practical low-rank bottleneck before the useless dense random bridge). End goal: **native** checkpoint after fold + **LoRA rank 128** with FFN adapters.
 
 ## Quality ladder (best → acceptable)
@@ -13,7 +15,9 @@ Use **bridge rank 512** (highest practical low-rank bottleneck before the useles
 | 5 | **Fold** → native LTX | `fold_flat_dim_bridge.py --flat-dim-bridge-rank 512` |
 | 6 | Probe native (exit **0**) | same probe on folded checkpoint |
 | 7 | Re-preprocess **native** | same `dataset.json`, **native** `model_path`, **no** bridge rank; `rm -rf conditions/` first |
-| 8 | **Phase 2** — native LoRA 128 | `ltx2_av_lora_gemma4_native_best.yaml` |
+| 8 | **Phase 2** — native LoRA 128 | `ltx2_av_lora_gemma4_31b_native_best.yaml` |
+
+**Gopex 31B one-shot script:** `../../../scripts/kino-gemma4-native-path.sh` (plan → phase1a → fold → native-preprocess → phase2).
 
 **Interim** (if you train DiT before fold): `ltx2_av_lora_gemma4_rank512_connectors.yaml` after step 2.
 

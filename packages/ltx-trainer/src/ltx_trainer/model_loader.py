@@ -20,12 +20,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-import torch
-
 from ltx_trainer import logger
 from ltx_trainer.nvml_safe_cuda import apply_nvml_safe_cuda_patches
 
 apply_nvml_safe_cuda_patches()
+
+import torch
 
 # Type alias for device specification
 Device = str | torch.device
