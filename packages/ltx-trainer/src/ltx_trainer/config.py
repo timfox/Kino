@@ -521,6 +521,33 @@ class WandbConfig(ConfigBaseModel):
     )
 
 
+class LatentHdrConfig(ConfigBaseModel):
+    """LatentHDR-style exposure head (joint L_diff + λ L_ev). Requires HDR preprocess shards."""
+
+    enabled: bool = Field(
+        default=False,
+        description="Add L_ev from FiLMResidualExposureHead when latents include hdr_ldr_ev_stack",
+    )
+    lambda_ev: float = Field(
+        default=0.5,
+        ge=0.0,
+        description="Weight on exposure latent MSE (LatentHDR paper: joint with diffusion loss)",
+    )
+    exposure_head_checkpoint: str | Path | None = Field(
+        default=None,
+        description="Path to train_latenthdr_exposure.py output .pt (state_dict + latent_channels)",
+    )
+    train_exposure_head: bool = Field(
+        default=False,
+        description="Include exposure head in optimizer (usually false after phase-1 head train)",
+    )
+    latent_channels: int = Field(
+        default=128,
+        ge=8,
+        description="VAE latent channel count when building a fresh head (ignored when loading checkpoint)",
+    )
+
+
 class FlowMatchingConfig(ConfigBaseModel):
     """Configuration for flow matching training"""
 
@@ -552,6 +579,7 @@ class LtxTrainerConfig(ConfigBaseModel):
     checkpoints: CheckpointsConfig = Field(default_factory=CheckpointsConfig)
     hub: HubConfig = Field(default_factory=HubConfig)
     flow_matching: FlowMatchingConfig = Field(default_factory=FlowMatchingConfig)
+    latenthdr: LatentHdrConfig = Field(default_factory=LatentHdrConfig)
     wandb: WandbConfig = Field(default_factory=WandbConfig)
 
     # General configuration
@@ -593,6 +621,12 @@ class LtxTrainerConfig(ConfigBaseModel):
         # Check that LoRA config is provided when using video_to_video strategy
         if self.training_strategy.name == "video_to_video" and self.model.training_mode != "lora":
             raise ValueError("Training mode must be 'lora' when using video_to_video strategy")
+
+        if self.latenthdr.enabled:
+            if not self.latenthdr.exposure_head_checkpoint and not self.latenthdr.train_exposure_head:
+                raise ValueError(
+                    "latenthdr.enabled requires exposure_head_checkpoint or train_exposure_head=true"
+                )
 
         if self.model.finetune_text_stack:
             if not self.model.text_encoder_path:

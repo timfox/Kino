@@ -1,20 +1,18 @@
-"""LatentHDR-style exposure modeling (research scaffolding).
+"""LatentHDR exposure modeling (FiLM head, EV conditioning, trainer hooks)."""
 
-This package is **not** wired into the main ``LtxvTrainer`` flow yet. It provides:
-
-- Fourier + MLP conditioning on scalar EV (LatentHDR Sec. 3.3, ``φ(e)``).
-- A lightweight FiLM-modulated 3D residual stack predicting ``Δz`` with ``z_e = z_base + Δz``.
-- A simple ``L_ev`` MSE between predicted and VAE-encoded exposure latents.
-
-See ``scripts/train_latenthdr_exposure.py`` and ``tools/latenthdr_trainer_qt.py`` for the separate GUI / CLI entrypoints.
-"""
-
-from ltx_trainer.latenthdr.ev_embedding import EVConditionMLP
-from ltx_trainer.latenthdr.exposure_head import FiLMResidualExposureHead
-from ltx_trainer.latenthdr.losses import exposure_latent_mse
+from ltx_trainer.latenthdr.ev_embedding import ExposureValueEmbedding
+from ltx_trainer.latenthdr.exposure_head import FiLMResidualExposureHead, exposure_latent_mse
+from ltx_trainer.latenthdr.training import (
+    compute_latenthdr_ev_loss,
+    load_exposure_head_from_checkpoint,
+    sample_ev_targets_from_batch,
+)
 
 __all__ = [
-    "EVConditionMLP",
+    "ExposureValueEmbedding",
     "FiLMResidualExposureHead",
+    "compute_latenthdr_ev_loss",
     "exposure_latent_mse",
+    "load_exposure_head_from_checkpoint",
+    "sample_ev_targets_from_batch",
 ]

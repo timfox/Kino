@@ -148,6 +148,7 @@ class TrainingStepOutput:
 
     loss: Tensor  # [B,] per-element loss (unreduced)
     sigma: Tensor  # [B,] sampled sigma, detached from computational graph
+    latenthdr_loss: Tensor | None = None  # scalar L_ev when latenthdr.enabled
 
 
 class LtxvTrainer:
@@ -171,6 +172,7 @@ class LtxvTrainer:
         self._training_state_size_warned = False
         self._wandb_run = None
         self._sigma_tracker = SigmaBucketTracker()
+        self._exposure_head = None
 
         if self._config.model.finetune_text_connectors and self._config.validation.prompts:
             if self._cached_validation_embeddings and not all(
@@ -354,6 +356,8 @@ class LtxvTrainer:
                             "train/step_time": step_time,
                             "train/global_step": self._global_step,
                         }
+                        if output.latenthdr_loss is not None:
+                            metrics["train/latenthdr_ev_loss"] = float(output.latenthdr_loss.detach().item())
                         metrics.update(self._sigma_tracker.get_metrics())
                         self._log_metrics(metrics)
 
@@ -464,7 +468,19 @@ class LtxvTrainer:
         loss = self._training_strategy.compute_loss(video_pred, audio_pred, model_inputs)
         sigma = model_inputs.video.sigma.detach() if model_inputs.video.enabled else model_inputs.audio.sigma.detach()
 
-        return TrainingStepOutput(loss=loss, sigma=sigma)
+        latenthdr_loss: Tensor | None = None
+        if self._config.latenthdr.enabled and self._exposure_head is not None:
+            from ltx_trainer.latenthdr import compute_latenthdr_ev_loss
+
+            latenthdr_loss = compute_latenthdr_ev_loss(
+                batch,
+                self._exposure_head,
+                device=self._accelerator.device,
+            )
+            if latenthdr_loss is not None:
+                loss = loss + self._config.latenthdr.lambda_ev * latenthdr_loss
+
+        return TrainingStepOutput(loss=loss, sigma=sigma, latenthdr_loss=latenthdr_loss)
 
     def _encode_live_captions(self, batch: dict) -> tuple[Tensor, Tensor | None, Tensor]:
         """Gemma encode → feature_extractor → connectors for each sample in the batch."""
@@ -701,7 +717,36 @@ class LtxvTrainer:
                 " + LoRA adapters" if mode == "lora" else "",
             )
 
+        self._setup_latenthdr()
         logger.debug(f"Trainable params count: {sum(p.numel() for p in self._trainable_params):,}")
+
+    def _setup_latenthdr(self) -> None:
+        """Load optional LatentHDR exposure head for joint L_ev."""
+        if not self._config.latenthdr.enabled:
+            return
+        from ltx_trainer.latenthdr import FiLMResidualExposureHead, load_exposure_head_from_checkpoint
+
+        cfg = self._config.latenthdr
+        if cfg.exposure_head_checkpoint:
+            self._exposure_head = load_exposure_head_from_checkpoint(
+                cfg.exposure_head_checkpoint,
+                device="cpu",
+            )
+        else:
+            self._exposure_head = FiLMResidualExposureHead(latent_channels=cfg.latent_channels)
+
+        if cfg.train_exposure_head:
+            self._exposure_head.requires_grad_(True)
+            head_params = [p for p in self._exposure_head.parameters() if p.requires_grad]
+            self._trainable_params.extend(head_params)
+            logger.info(
+                "LatentHDR exposure head trainable: %s parameters (λ_ev=%s)",
+                f"{sum(p.numel() for p in head_params):,}",
+                cfg.lambda_ev,
+            )
+        else:
+            self._exposure_head.requires_grad_(False)
+            logger.info("LatentHDR exposure head frozen (λ_ev=%s)", cfg.lambda_ev)
 
     def _init_timestep_sampler(self) -> None:
         """Initialize the timestep sampler based on the config."""
@@ -913,6 +958,11 @@ class LtxvTrainer:
 
         # noinspection PyTypeChecker
         self._transformer = self._accelerator.prepare(self._transformer)
+
+        if self._exposure_head is not None:
+            self._exposure_head = self._exposure_head.to(self._accelerator.device)
+            if not self._config.latenthdr.train_exposure_head:
+                self._exposure_head.eval()
 
         # Log GPU memory usage after model preparation
         vram_usage_gb = torch.cuda.memory_allocated() / 1024**3
