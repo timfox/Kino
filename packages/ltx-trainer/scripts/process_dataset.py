@@ -139,6 +139,12 @@ def preprocess_dataset(  # noqa: PLR0913
             "yes",
         ):
             effective_bridge_rank = int(os.environ.get("LTX_DEFAULT_FLAT_DIM_BRIDGE_RANK", "32"))
+        hdr_extra = {
+            "hdr_ingest": hdr_ingest,
+            "hdr_transfer": ht,
+            "hdr_vae_encoding": hve,
+            "hdr_synth_bracket_ev": hdr_synth_bracket_ev,
+        }
         write_preprocess_meta(
             output_base,
             model_path=model_path,
@@ -146,6 +152,7 @@ def preprocess_dataset(  # noqa: PLR0913
             flat_dim_bridge_rank=effective_bridge_rank,
             dataset_file=dataset_file,
             resolution_buckets=resolution_buckets,
+            extra=hdr_extra,
         )
         logger.info(f"Captions-only preprocess complete. Results under {output_base}")
         return
@@ -256,6 +263,12 @@ def preprocess_dataset(  # noqa: PLR0913
     ):
         effective_bridge_rank = int(os.environ.get("LTX_DEFAULT_FLAT_DIM_BRIDGE_RANK", "32"))
 
+    hdr_extra = {
+        "hdr_ingest": hdr_ingest,
+        "hdr_transfer": ht,
+        "hdr_vae_encoding": hve,
+        "hdr_synth_bracket_ev": hdr_synth_bracket_ev,
+    }
     write_preprocess_meta(
         output_base,
         model_path=model_path,
@@ -263,6 +276,7 @@ def preprocess_dataset(  # noqa: PLR0913
         flat_dim_bridge_rank=effective_bridge_rank,
         dataset_file=dataset_file,
         resolution_buckets=resolution_buckets,
+        extra=hdr_extra,
     )
 
     # Print summary

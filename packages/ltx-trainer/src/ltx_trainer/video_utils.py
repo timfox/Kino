@@ -16,7 +16,7 @@ import av
 import numpy as np
 import torch
 from ltx_trainer import logger
-from ltx_trainer.media_formats import prefer_ffmpeg_video_decode
+from ltx_trainer.media_formats import is_insta360_path, prefer_ffmpeg_video_decode
 from torch import Tensor
 
 VideoFormat = Literal["CFHW", "FCHW"]
@@ -29,7 +29,19 @@ def _video_backend() -> str:
 def _use_ffmpeg_decode(video_path: str | Path) -> bool:
     if _video_backend() == "ffmpeg":
         return True
+    if is_insta360_path(video_path):
+        return True
     return prefer_ffmpeg_video_decode(video_path)
+
+
+def _resolve_video_path(video_path: str | Path) -> Path:
+    """Expand Insta360 containers to decode-ready paths (proxy MP4 or still JPEG)."""
+    path = Path(video_path).expanduser()
+    if not is_insta360_path(path):
+        return path.resolve()
+    from ltx_trainer.insta360_ingest import resolve_insta360_decode_path
+
+    return resolve_insta360_decode_path(path)
 
 
 def _read_video_ffmpeg(video_path: str | Path, max_frames: int | None) -> tuple[Tensor, float]:
@@ -62,14 +74,12 @@ def _read_video_pyav(video_path: str | Path, max_frames: int | None) -> tuple[Te
 
 def get_video_frame_count(video_path: str | Path) -> int:
     """Get the number of frames in a video file.
+
     Tries three approaches in order: stream metadata, duration*fps estimate,
     full decode. The estimate may be off by a few frames for VFR videos or
     containers with edit lists — exact for the min_frames filtering use case.
-    Args:
-        video_path: Path to the video file
-    Returns:
-        Number of frames in the video
     """
+    video_path = _resolve_video_path(video_path)
     if _use_ffmpeg_decode(video_path):
         from ltx_trainer.ffmpeg_io import estimate_frame_count
 
@@ -106,13 +116,8 @@ def _get_video_frame_count_pyav(video_path: str | Path) -> int:
 
 
 def read_video(video_path: str | Path, max_frames: int | None = None) -> tuple[Tensor, float]:
-    """Load frames from a video file (PyAV by default; ffmpeg for ``.mov`` / on failure).
-    Args:
-        video_path: Path to the video file
-        max_frames: Maximum number of frames to read. If None, reads all frames.
-    Returns:
-        Video tensor with shape [F, C, H, W] in range [0, 1] and frames per second (fps).
-    """
+    """Load frames from a video file (PyAV by default; ffmpeg for ``.mov`` / Insta360 / on failure)."""
+    video_path = _resolve_video_path(video_path)
     path = Path(video_path)
     if _use_ffmpeg_decode(path):
         return _read_video_ffmpeg(path, max_frames)

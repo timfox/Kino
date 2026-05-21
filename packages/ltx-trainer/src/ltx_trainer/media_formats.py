@@ -15,11 +15,19 @@ COMMON_STILL_IMAGE_SUFFIXES: frozenset[str] = frozenset(
     {".png", ".jpg", ".jpeg", ".webp", ".heic", ".heif", ".bmp", ".tif", ".tiff"}
 )
 
-STILL_IMAGE_SUFFIXES: frozenset[str] = COMMON_STILL_IMAGE_SUFFIXES | CANON_RAW_SUFFIXES
-
 VIDEO_SUFFIXES: frozenset[str] = frozenset(
     {".mp4", ".mov", ".mkv", ".webm", ".m4v", ".avi", ".ogv", ".qt", ".mxf"}
 )
+
+# Insta360 proprietary containers (H.264/HEVC inside; decode via :mod:`ltx_trainer.insta360_ingest`).
+INSTA360_VIDEO_SUFFIXES: frozenset[str] = frozenset({".insv", ".lrv"})
+INSTA360_STILL_SUFFIXES: frozenset[str] = frozenset({".insp"})
+INSTA360_SUFFIXES: frozenset[str] = INSTA360_VIDEO_SUFFIXES | INSTA360_STILL_SUFFIXES
+
+STILL_IMAGE_SUFFIXES: frozenset[str] = COMMON_STILL_IMAGE_SUFFIXES | CANON_RAW_SUFFIXES | INSTA360_STILL_SUFFIXES
+
+# Union used by dataset discovery / split tools.
+ALL_VIDEO_SUFFIXES: frozenset[str] = VIDEO_SUFFIXES | INSTA360_VIDEO_SUFFIXES
 
 # QuickTime / MOV containers: decode via ffmpeg by default (ProRes, DNxHD, edit lists).
 FFMPEG_PREFERRED_VIDEO_SUFFIXES: frozenset[str] = frozenset({".mov", ".qt"})
@@ -42,7 +50,19 @@ def is_still_image_path(path: str | Path) -> bool:
 
 
 def is_video_path(path: str | Path) -> bool:
-    return path_suffix_lower(path) in VIDEO_SUFFIXES
+    return path_suffix_lower(path) in ALL_VIDEO_SUFFIXES
+
+
+def is_insta360_video_path(path: str | Path) -> bool:
+    return path_suffix_lower(path) in INSTA360_VIDEO_SUFFIXES
+
+
+def is_insta360_still_path(path: str | Path) -> bool:
+    return path_suffix_lower(path) in INSTA360_STILL_SUFFIXES
+
+
+def is_insta360_path(path: str | Path) -> bool:
+    return path_suffix_lower(path) in INSTA360_SUFFIXES
 
 
 def prefer_ffmpeg_video_decode(path: str | Path) -> bool:
@@ -52,6 +72,8 @@ def prefer_ffmpeg_video_decode(path: str | Path) -> bool:
     for all containers.
     """
     suf = path_suffix_lower(path)
+    if suf in INSTA360_VIDEO_SUFFIXES:
+        return True
     if suf not in FFMPEG_PREFERRED_VIDEO_SUFFIXES:
         return False
     mode = os.environ.get("LTX_MOV_DECODE", "ffmpeg").strip().lower()

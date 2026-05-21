@@ -89,21 +89,48 @@ _run_batch_preprocess() {
     export GOPEX_FORCE_NVML_SAFE=1
     echo "nvidia-smi failed — GOPEX_FORCE_NVML_SAFE=1 (Gemma + embeddings processor on CPU where needed)"
   fi
+  local _pre_root="$WORK_ROOT"
+  local _pre_args=(
+    --search-roots /run/media/tim/Datasets/datasets
+    --run --preprocess-only --skip-existing --continue-on-error
+    --work-root "$_pre_root"
+    --model-path "$LTX_CKPT"
+    --text-encoder-path "$GEMMA"
+    --flat-dim-bridge-rank "$BRIDGE_RANK"
+    --vae-tiling --load-text-encoder-in-8bit
+  )
+  if [[ "${GOPEX_HDR_PREPROCESS:-0}" == "1" ]]; then
+    _pre_root="$WORK_ROOT"
+    export GOPEX_PRECOMPUTED_SUBDIR="precomputed-hdr"
+    _pre_args=(
+      --search-roots /run/media/tim/Datasets/datasets
+      --run --preprocess-only --skip-existing --continue-on-error
+      --work-root "$_pre_root"
+      --model-path "$LTX_CKPT"
+      --text-encoder-path "$GEMMA"
+      --flat-dim-bridge-rank "$BRIDGE_RANK"
+      --vae-tiling --load-text-encoder-in-8bit
+      --hdr-ingest
+      --hdr-transfer "${HDR_TRANSFER:-auto}"
+      --hdr-vae-encoding "${HDR_VAE_ENCODING:-logc3}"
+      --hdr-synth-bracket-ev "${HDR_SYNTH_BRACKET_EV:--7:5:1}"
+    )
+    echo "HDR preprocess → ${WORK_ROOT}/precomputed-hdr/ (GOPEX_HDR_PREPROCESS=1)"
+  else
+    unset GOPEX_PRECOMPUTED_SUBDIR 2>/dev/null || true
+  fi
   python "$GOPEX_REPO/tools/dataset_batch_pipeline.py" /run/media/tim/Expansion/datasets \
-    --search-roots /run/media/tim/Datasets/datasets \
-    --run --preprocess-only --skip-existing --continue-on-error \
-    --work-root "$WORK_ROOT" \
-    --model-path "$LTX_CKPT" \
-    --text-encoder-path "$GEMMA" \
-    --flat-dim-bridge-rank "$BRIDGE_RANK" \
-    --vae-tiling --load-text-encoder-in-8bit \
+    "${_pre_args[@]}" \
     2>&1 | tee -a "$WORK_ROOT/logs/batch-preprocess.log"
   echo "=== Audit precomputed trees (strict) ==="
   for root in \
     "$PRECOMPUTED_ROOT" \
+    "${PRECOMPUTED_HDR_ROOT:-}" \
     "$WORK_ROOT/precomputed" \
+    "$WORK_ROOT/precomputed-hdr" \
     /run/media/tim/Expansion/gopex-ltx/precomputed \
     /run/media/tim/Expansion/gopex-ltx/gemma31b-r512/precomputed; do
+    [[ -z "$root" ]] && continue
     if [[ -d "$root" ]]; then
       echo "--- audit: $root"
       python "$GOPEX_REPO/tools/ltx_precomputed_audit.py" --preprocessed-root "$root" --strict || true
@@ -206,6 +233,14 @@ python "$GOPEX_REPO/pipeline/two_stage_hq_kino.py" \
   --distilled-lora-strength-stage-2 0.5 \
   --experimental-flat-dim-bridge \
   2>&1 | tee "$WORK_ROOT/logs/hq-two-stage.log"
+
+if [[ "${RUN_SFM_4DGS:-0}" == "1" && -f "$HQ_OUT" ]]; then
+  echo "=== 7b) SfM → 4DGS bundle from HQ output ==="
+  SFM_4DGS_DIR="${WORK_ROOT}/sfm/hq_two_stage"
+  python "$GOPEX_REPO/tools/sfm_to_4dgs.py" --video "$HQ_OUT" --output-dir "$SFM_4DGS_DIR" --backend auto \
+    2>&1 | tee "$WORK_ROOT/logs/sfm-4dgs.log"
+  python "$GOPEX_REPO/tools/sfm_to_4dgs.py" --sfm-dir "$SFM_4DGS_DIR" --plan
+fi
 
 echo "=== 8) Qt UIs (optional, same assets) ==="
 echo "  python $GOPEX_REPO/tools/two_stage_hq_kino_qt.py"
