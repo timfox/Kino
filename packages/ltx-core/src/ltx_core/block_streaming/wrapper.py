@@ -52,7 +52,19 @@ class BlockStreamingWrapper(nn.Module):
 
         block = self._blocks[block_idx]
         for name, _param in itertools.chain(block.named_parameters(), block.named_buffers()):
-            assign_tensor_to_module(block, name, gpu_weights[name])
+            # LTX-2.5 ships ``ff_bias: false``; skip module params the ckpt never stored.
+            tensor = gpu_weights.get(name)
+            if tensor is None:
+                parts = name.split(".")
+                parent = block
+                for part in parts[:-1]:
+                    parent = getattr(parent, part)
+                leaf = parts[-1]
+                if leaf in parent._parameters:
+                    # Drop meta-device bias so F.linear does not add a CPU/meta tensor.
+                    parent._parameters[leaf] = None
+                continue
+            assign_tensor_to_module(block, name, tensor)
 
     def _post_hook(self, block_idx: int) -> None:
         """Record a compute-done event and release the block weights."""

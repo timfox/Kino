@@ -1,0 +1,1 @@
+from ltx_trainer.step37_flash.evaluation import evaluation_smoke

@@ -1,0 +1,1 @@
+from ltx_trainer.deepswe.evaluation import evaluation_smoke

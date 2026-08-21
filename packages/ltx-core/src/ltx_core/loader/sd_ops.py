@@ -6,10 +6,12 @@ import torch
 
 @dataclass(frozen=True, slots=True)
 class ContentReplacement:
-    """Replace ``content`` with ``replacement`` in a state dict key.
+    """
+    Represents a content replacement operation.
+    Used to replace a specific content with a replacement in a state dict key.
 
     When ``prefix_only`` is True, only keys that *start with* ``content`` are rewritten (prefix swap), avoiding
-    accidental matches inside longer keys (for example ``model.language_model.*`` vs. the substring ``language_model.``).
+    accidental matches inside longer keys.
     """
 
     content: str
@@ -26,6 +28,7 @@ class ContentMatching:
 
     prefix: str = ""
     suffix: str = ""
+    contains: str = ""
 
 
 class KeyValueOperationResult(NamedTuple):
@@ -74,10 +77,10 @@ class SDOps:
         new_mapping = (*self.mapping, ContentReplacement(content, replacement, prefix_only))
         return replace(self, mapping=new_mapping)
 
-    def with_matching(self, prefix: str = "", suffix: str = "") -> "SDOps":
-        """Create a new SDOps instance with the specified prefix and suffix matching added to the mapping."""
+    def with_matching(self, prefix: str = "", suffix: str = "", contains: str = "") -> "SDOps":
+        """Create a new SDOps instance with the specified prefix, suffix and contains matching added to the mapping."""
 
-        new_mapping = (*self.mapping, ContentMatching(prefix, suffix))
+        new_mapping = (*self.mapping, ContentMatching(prefix, suffix, contains))
         return replace(self, mapping=new_mapping)
 
     def with_additional_allowed_keys(self, keys: frozenset[str]) -> "SDOps":
@@ -102,7 +105,12 @@ class SDOps:
     def apply_to_key(self, key: str) -> str | None:
         """Apply the mapping to the given name."""
         matchers = [content for content in self.mapping if isinstance(content, ContentMatching)]
-        valid = any(key.startswith(f.prefix) and key.endswith(f.suffix) for f in matchers)
+        valid = any(
+            key.startswith(matcher.prefix)
+            and key.endswith(matcher.suffix)
+            and (not matcher.contains or matcher.contains in key)
+            for matcher in matchers
+        )
         if not valid:
             return None
 

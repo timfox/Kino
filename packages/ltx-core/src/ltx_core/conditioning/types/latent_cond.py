@@ -9,8 +9,8 @@ from ltx_core.types import LatentState
 class VideoConditionByLatentIndex(ConditioningItem):
     """
     Conditions video generation by injecting latents at a specific latent frame index.
-    Replaces tokens in the latent state at positions corresponding to latent_idx,
-    and sets denoise strength according to the strength parameter.
+    Sets the clean latents at positions corresponding to latent_idx to the injected latents,
+    sets denoise strength according to the strength parameter.
     """
 
     def __init__(self, latent: torch.Tensor, strength: float, latent_idx: int):
@@ -19,8 +19,7 @@ class VideoConditionByLatentIndex(ConditioningItem):
         self.latent_idx = latent_idx
 
     def apply_to(self, latent_state: LatentState, latent_tools: LatentTools) -> LatentState:
-        cond_latent = self.latent.to(device=latent_state.latent.device, dtype=latent_state.latent.dtype)
-        cond_batch, cond_channels, _, cond_height, cond_width = cond_latent.shape
+        cond_batch, cond_channels, _, cond_height, cond_width = self.latent.shape
         tgt_batch, tgt_channels, tgt_frames, tgt_height, tgt_width = latent_tools.target_shape.to_torch_shape()
 
         if (cond_batch, cond_channels, cond_height, cond_width) != (tgt_batch, tgt_channels, tgt_height, tgt_width):
@@ -30,7 +29,7 @@ class VideoConditionByLatentIndex(ConditioningItem):
                 "the image and latent have the same spatial shape."
             )
 
-        tokens = latent_tools.patchifier.patchify(cond_latent)
+        tokens = latent_tools.patchifier.patchify(self.latent)
         start_token = latent_tools.patchifier.get_token_count(
             latent_tools.target_shape._replace(frames=self.latent_idx)
         )
@@ -38,7 +37,6 @@ class VideoConditionByLatentIndex(ConditioningItem):
 
         latent_state = latent_state.clone()
 
-        latent_state.latent[:, start_token:stop_token] = tokens
         latent_state.clean_latent[:, start_token:stop_token] = tokens
         latent_state.denoise_mask[:, start_token:stop_token] = 1.0 - self.strength
 

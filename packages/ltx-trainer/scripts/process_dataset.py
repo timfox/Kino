@@ -21,6 +21,7 @@ from process_captions import compute_captions_embeddings
 from process_videos import (
     _ALLOWED_HDR_TRANSFER,
     _ALLOWED_HDR_VAE_ENCODING,
+    _default_with_audio_from_env,
     _parse_latent_save_dtype,
     compute_latents,
     compute_scaled_resolution_buckets,
@@ -68,6 +69,8 @@ def preprocess_dataset(  # noqa: PLR0913
     skip_existing: bool = False,
     captions_only: bool = False,
     latents_only: bool = False,
+    require_latents: bool = False,
+    embeddings_device: str | None = None,
 ) -> None:
     """Run the preprocessing pipeline with the given arguments."""
     # Validate dataset file
@@ -108,6 +111,11 @@ def preprocess_dataset(  # noqa: PLR0913
     if lora_trigger:
         logger.info(f'LoRA trigger word "{lora_trigger}" will be prepended to all captions')
 
+    import os
+
+    if not require_latents:
+        require_latents = os.environ.get("GOPEX_CONDITIONS_REQUIRE_LATENTS", "0").strip() in ("1", "true", "yes")
+
     if not latents_only:
         with free_gpu_memory_context():
             # Process captions using the dedicated function
@@ -125,6 +133,9 @@ def preprocess_dataset(  # noqa: PLR0913
                 load_in_8bit=load_text_encoder_in_8bit,
                 flat_dim_bridge_rank=flat_dim_bridge_rank,
                 skip_existing=skip_existing,
+                require_latents=require_latents,
+                latents_dir=str(latents_dir) if require_latents else None,
+                embeddings_device=embeddings_device,
             )
 
     if captions_only:
@@ -132,11 +143,17 @@ def preprocess_dataset(  # noqa: PLR0913
 
         from ltx_trainer.preprocess_meta import write_preprocess_meta
 
+        model_is_native = (Path(model_path) / "native_manifest.json").is_file()
         effective_bridge_rank = flat_dim_bridge_rank
-        if effective_bridge_rank is None and os.environ.get("LTX_ALLOW_DENSE_FLAT_DIM_BRIDGE", "").lower() not in (
-            "1",
-            "true",
-            "yes",
+        if (
+            effective_bridge_rank is None
+            and not model_is_native
+            and os.environ.get("LTX_ALLOW_DENSE_FLAT_DIM_BRIDGE", "").lower()
+            not in (
+                "1",
+                "true",
+                "yes",
+            )
         ):
             effective_bridge_rank = int(os.environ.get("LTX_DEFAULT_FLAT_DIM_BRIDGE_RANK", "32"))
         hdr_extra = {
@@ -145,6 +162,17 @@ def preprocess_dataset(  # noqa: PLR0913
             "hdr_vae_encoding": hve,
             "hdr_synth_bracket_ev": hdr_synth_bracket_ev,
         }
+        from ltx_trainer.cert_las.hooks import merge_preprocess_extra as merge_cert_las_extra
+        from ltx_trainer.core_kd.hooks import merge_preprocess_extra as merge_core_kd_extra
+        from ltx_trainer.flatsounds.hooks import merge_preprocess_extra as merge_flatsounds_extra
+        from ltx_trainer.vlm_count.hooks import merge_preprocess_extra as merge_vlm_count_extra
+        from ltx_trainer.pesd_vit.hooks import merge_preprocess_extra as merge_pesd_vit_extra
+        from ltx_trainer.entroad.hooks import merge_preprocess_extra as merge_entroad_extra
+        from ltx_trainer.eigenet.hooks import merge_preprocess_extra as merge_eigenet_extra
+        from ltx_trainer.mtavg2.diagnosis import merge_preprocess_extra as merge_mtavg2_extra
+        from ltx_trainer.planaudio.hooks import merge_preprocess_extra as merge_planaudio_extra
+        from ltx_trainer.vcap.captioning import merge_preprocess_extra as merge_vcap_extra
+
         write_preprocess_meta(
             output_base,
             model_path=model_path,
@@ -152,7 +180,21 @@ def preprocess_dataset(  # noqa: PLR0913
             flat_dim_bridge_rank=effective_bridge_rank,
             dataset_file=dataset_file,
             resolution_buckets=resolution_buckets,
-            extra=hdr_extra,
+            extra=merge_vlm_count_extra(
+                merge_core_kd_extra(
+                    merge_flatsounds_extra(
+                        merge_pesd_vit_extra(
+                            merge_cert_las_extra(
+                                merge_entroad_extra(
+                                    merge_eigenet_extra(
+                                        merge_planaudio_extra(merge_mtavg2_extra(merge_vcap_extra(hdr_extra)))
+                                    )
+                                )
+                            )
+                        )
+                    )
+                )
+            ),
         )
         logger.info(f"Captions-only preprocess complete. Results under {output_base}")
         return
@@ -255,20 +297,43 @@ def preprocess_dataset(  # noqa: PLR0913
 
     from ltx_trainer.preprocess_meta import write_preprocess_meta
 
+    model_is_native = (Path(model_path) / "native_manifest.json").is_file()
     effective_bridge_rank = flat_dim_bridge_rank
-    if effective_bridge_rank is None and os.environ.get("LTX_ALLOW_DENSE_FLAT_DIM_BRIDGE", "").lower() not in (
-        "1",
-        "true",
-        "yes",
+    if (
+        effective_bridge_rank is None
+        and not model_is_native
+        and os.environ.get("LTX_ALLOW_DENSE_FLAT_DIM_BRIDGE", "").lower()
+        not in (
+            "1",
+            "true",
+            "yes",
+        )
     ):
         effective_bridge_rank = int(os.environ.get("LTX_DEFAULT_FLAT_DIM_BRIDGE_RANK", "32"))
+
+    from ltx_trainer.fold_registry import fold_hooks_for_preprocess_meta
 
     hdr_extra = {
         "hdr_ingest": hdr_ingest,
         "hdr_transfer": ht,
         "hdr_vae_encoding": hve,
         "hdr_synth_bracket_ev": hdr_synth_bracket_ev,
+        "av_fold_enabled": os.environ.get("GOPEX_ENABLE_AV_FOLD", "").strip() in ("1", "true", "yes"),
+        "av_fold_hooks": fold_hooks_for_preprocess_meta()
+        if os.environ.get("GOPEX_ENABLE_AV_FOLD", "").strip() in ("1", "true", "yes")
+        else [],
     }
+    from ltx_trainer.cert_las.hooks import merge_preprocess_extra as merge_cert_las_extra
+    from ltx_trainer.core_kd.hooks import merge_preprocess_extra as merge_core_kd_extra
+    from ltx_trainer.flatsounds.hooks import merge_preprocess_extra as merge_flatsounds_extra
+    from ltx_trainer.vlm_count.hooks import merge_preprocess_extra as merge_vlm_count_extra
+    from ltx_trainer.pesd_vit.hooks import merge_preprocess_extra as merge_pesd_vit_extra
+    from ltx_trainer.entroad.hooks import merge_preprocess_extra as merge_entroad_extra
+    from ltx_trainer.eigenet.hooks import merge_preprocess_extra as merge_eigenet_extra
+    from ltx_trainer.mtavg2.diagnosis import merge_preprocess_extra as merge_mtavg2_extra
+    from ltx_trainer.planaudio.hooks import merge_preprocess_extra as merge_planaudio_extra
+    from ltx_trainer.vcap.captioning import merge_preprocess_extra as merge_vcap_extra
+
     write_preprocess_meta(
         output_base,
         model_path=model_path,
@@ -276,7 +341,21 @@ def preprocess_dataset(  # noqa: PLR0913
         flat_dim_bridge_rank=effective_bridge_rank,
         dataset_file=dataset_file,
         resolution_buckets=resolution_buckets,
-        extra=hdr_extra,
+        extra=merge_vlm_count_extra(
+            merge_core_kd_extra(
+                merge_flatsounds_extra(
+                    merge_pesd_vit_extra(
+                        merge_cert_las_extra(
+                            merge_entroad_extra(
+                                merge_eigenet_extra(
+                                    merge_planaudio_extra(merge_mtavg2_extra(merge_vcap_extra(hdr_extra)))
+                                )
+                            )
+                        )
+                    )
+                )
+            )
+        ),
     )
 
     # Print summary
@@ -360,8 +439,8 @@ def main(  # noqa: PLR0913
         help="Column name containing reference video paths (for video-to-video training)",
     ),
     with_audio: bool = typer.Option(
-        default=False,
-        help="Extract and encode audio from video files",
+        default=_default_with_audio_from_env(),
+        help="Extract and encode audio from video files (default: on; set GOPEX_PREP_WITH_AUDIO=0 to disable)",
     ),
     load_text_encoder_in_8bit: bool = typer.Option(
         default=False,
@@ -381,6 +460,10 @@ def main(  # noqa: PLR0913
         default=False,
         help="Skip caption/latent shards that already exist on disk (resume interrupted preprocess)",
     ),
+    embeddings_device: str | None = typer.Option(
+        default=None,
+        help="Device for LTX embeddings processor (default: CPU when Gemma 31B bf16 on GPU — see GOPEX_EMBEDDINGS_PROCESSOR_ON_CPU)",
+    ),
     captions_only: bool = typer.Option(
         default=False,
         help="Only embed captions (no VAE latents). Skips Gemma if combined with latents-only on a second run.",
@@ -388,6 +471,10 @@ def main(  # noqa: PLR0913
     latents_only: bool = typer.Option(
         default=False,
         help="Only encode video latents (no Gemma / embeddings processor). Use when conditions/ are already complete.",
+    ),
+    require_latents: bool = typer.Option(
+        default=False,
+        help="Captions-only: embed only rows that already have latent shards (or GOPEX_CONDITIONS_REQUIRE_LATENTS=1).",
     ),
     reference_downscale_factor: int = typer.Option(
         default=1,
@@ -498,6 +585,8 @@ def main(  # noqa: PLR0913
         skip_existing=skip_existing,
         captions_only=captions_only,
         latents_only=latents_only,
+        require_latents=require_latents,
+        embeddings_device=embeddings_device,
     )
 
 

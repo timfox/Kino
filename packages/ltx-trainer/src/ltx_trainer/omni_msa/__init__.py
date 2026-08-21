@@ -1,0 +1,98 @@
+"""Discriminative omni-modal MSA readout (arXiv:2606.05713)."""
+
+from ltx_trainer.omni_msa.config import OmniMsaConfig
+from ltx_trainer.omni_msa.layout import LIMITATIONS
+from ltx_trainer.omni_msa.metrics import (
+    acc2_nonzero,
+    acc7,
+    denormalize_labels,
+    f1_nonzero,
+    knn_label_smoothness,
+    mae,
+    normalize_labels,
+    out_of_range_rate,
+    parse_generative_score,
+    pearson_corr,
+    regression_bundle,
+    unparsable_rate,
+)
+from ltx_trainer.omni_msa.prompts import format_generative_prompt, prompt_bundle as omni_msa_prompt_bundle
+from ltx_trainer.omni_msa.qlora import qlora_spec, trainable_param_summary
+from ltx_trainer.omni_msa.train import fit_readout_head, train_discriminative_stub
+from ltx_trainer.omni_msa.mock import (
+    compare_readouts_smoke,
+    evaluation_smoke,
+    run_discriminative_smoke,
+    run_generative_smoke,
+    synthetic_mosi_batch,
+)
+from ltx_trainer.omni_msa.pipeline import (
+    benchmarks_bundle,
+    evaluation_demo,
+    figure3_readout_summary,
+    framework_card,
+    pipeline_demo,
+    representation_analysis,
+    table_i_mosei_sota,
+    table_ii_mosi_sota,
+    table_iii_seed_stability,
+    table_iv_readout_controlled,
+    table_v_modality_ablation,
+    table_vi_audio_denoising,
+)
+from ltx_trainer.omni_msa.readout import (
+    DiscriminativeHead,
+    ReadoutMode,
+    RegressionHeadConfig,
+    generative_decode,
+    generative_predict,
+    last_non_pad_index,
+    pool_last_non_pad,
+)
+
+__all__ = [
+    "DiscriminativeHead",
+    "LIMITATIONS",
+    "OmniMsaConfig",
+    "ReadoutMode",
+    "RegressionHeadConfig",
+    "acc2_nonzero",
+    "acc7",
+    "benchmarks_bundle",
+    "compare_readouts_smoke",
+    "denormalize_labels",
+    "evaluation_demo",
+    "evaluation_smoke",
+    "f1_nonzero",
+    "fit_readout_head",
+    "format_generative_prompt",
+    "figure3_readout_summary",
+    "framework_card",
+    "generative_decode",
+    "generative_predict",
+    "knn_label_smoothness",
+    "omni_msa_prompt_bundle",
+    "qlora_spec",
+    "last_non_pad_index",
+    "mae",
+    "normalize_labels",
+    "out_of_range_rate",
+    "parse_generative_score",
+    "pearson_corr",
+    "pipeline_demo",
+    "pool_last_non_pad",
+    "regression_bundle",
+    "representation_analysis",
+    "run_discriminative_smoke",
+    "run_generative_smoke",
+    "synthetic_mosi_batch",
+    "table_i_mosei_sota",
+    "table_ii_mosi_sota",
+    "table_iii_seed_stability",
+    "table_iv_readout_controlled",
+    "table_v_modality_ablation",
+    "table_vi_audio_denoising",
+    "train_discriminative_stub",
+    "trainable_param_summary",
+    "unparsable_rate",
+]

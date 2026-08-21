@@ -135,13 +135,15 @@ class Embeddings1DConnector(torch.nn.Module):
     def _replace_padded_with_learnable_registers(
         self, hidden_states: torch.Tensor, attention_mask: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        attention_mask = attention_mask.to(device=hidden_states.device)
         assert hidden_states.shape[1] % self.num_learnable_registers == 0, (
             f"Hidden states sequence length {hidden_states.shape[1]} must be divisible by num_learnable_registers "
             f"{self.num_learnable_registers}."
         )
 
         num_registers_duplications = hidden_states.shape[1] // self.num_learnable_registers
-        learnable_registers = torch.tile(self.learnable_registers, (num_registers_duplications, 1))
+        regs = self.learnable_registers.to(device=hidden_states.device, dtype=hidden_states.dtype)
+        learnable_registers = torch.tile(regs, (num_registers_duplications, 1))
         attention_mask_binary = (attention_mask.squeeze(1).squeeze(1).unsqueeze(-1) >= -9000.0).int()
 
         non_zero_hidden_states = hidden_states[:, attention_mask_binary.squeeze().bool(), :]

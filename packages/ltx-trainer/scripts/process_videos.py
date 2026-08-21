@@ -14,6 +14,8 @@ Can be used as a standalone script:
 
 import json
 import math
+import os
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -22,6 +24,7 @@ import pandas as pd
 import torch
 import torchaudio
 import typer
+from accelerate import PartialState
 from pillow_heif import register_heif_opener
 from rich.console import Console
 from rich.progress import (
@@ -34,10 +37,11 @@ from rich.progress import (
     TimeElapsedColumn,
     TimeRemainingColumn,
 )
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, Subset
 from torchvision import transforms
 from torchvision.transforms import InterpolationMode
 from torchvision.transforms.functional import crop, resize, to_tensor
+from torchvision.transforms.functional import resize as tv_resize
 from transformers.utils.logging import disable_progress_bar
 
 from ltx_core.model.audio_vae import AudioProcessor
@@ -60,7 +64,6 @@ from ltx_trainer.hdr_ingest import (
     x2hdr_meta_block,
 )
 from ltx_trainer.model_loader import load_audio_vae_encoder, load_video_vae_encoder
-from ltx_trainer.media_formats import is_still_image_path
 from ltx_trainer.utils import open_image_as_srgb
 from ltx_trainer.video_utils import get_video_frame_count, read_video
 
@@ -80,39 +83,22 @@ AUDIO_FREQUENCY_BINS = 16
 DEFAULT_TILE_SIZE = 512  # Spatial tile size in pixels (must be ≥64 and divisible by 32)
 DEFAULT_TILE_OVERLAP = 128  # Spatial tile overlap in pixels (must be divisible by 32)
 
-
-def resolve_dataset_media_path(dataset_file: str | Path, relative: str | Path) -> Path:
-    """Resolve a media path from dataset metadata.
-
-    Relative entries are usually resolved against ``dataset_file.parent``. When the manifest
-    lives in a subfolder (e.g. ``…/ltx_manifest/dataset.json``) but ``media_path`` is anchored at
-    the archive root (e.g. ``data/clip.mp4`` next to ``ltx_manifest/``), walk upward a few
-    directory levels until the file exists.
-    """
-    df = Path(dataset_file).resolve()
-    rel = Path(relative)
-    if rel.is_absolute():
-        return rel
-    cur = df.parent
-    for _ in range(8):
-        candidate = (cur / rel).resolve()
-        if candidate.is_file():
-            return candidate
-        parent = cur.parent
-        if parent == cur:
-            break
-        cur = parent
-    return (df.parent / rel).resolve()
+_ALLOWED_HDR_TRANSFER = frozenset({"auto", "pq", "hlg", "srgb", "linear"})
+_ALLOWED_HDR_VAE_ENCODING = frozenset({"reinhard", "pu21", "logc3", "lf_log1p"})
 
 
-def manifest_relative_posix(raw: str) -> str:
-    """Normalize a manifest path for output keys (``data/foo.pt`` under ``latents/``)."""
-    return Path(raw.strip()).as_posix()
+def _default_with_audio_from_env() -> bool:
+    return os.environ.get("GOPEX_PREP_WITH_AUDIO", "1").strip().lower() not in ("0", "false", "no", "off")
 
 
-def _clamp_tensor_01_inplace(tensor: torch.Tensor) -> torch.Tensor:
-    """Clamp to ``[0, 1]`` in place. Module-level so ``MediaDataset`` is picklable for DataLoader workers (Py 3.14+)."""
-    return tensor.clamp_(0.0, 1.0)
+def _parse_latent_save_dtype(name: str) -> torch.dtype:
+    key = name.lower().strip()
+    mapping = {"float32": torch.float32, "bfloat16": torch.bfloat16, "float16": torch.float16}
+    if key not in mapping:
+        raise typer.BadParameter(
+            f"Unknown latent save dtype {name!r}; expected one of: {', '.join(sorted(mapping))}"
+        )
+    return mapping[key]
 
 
 app = typer.Typer(
@@ -120,6 +106,10 @@ app = typer.Typer(
     no_args_is_help=True,
     help="Process videos/images and save latent representations for video generation training.",
 )
+
+
+def _clamp_01(x: torch.Tensor) -> torch.Tensor:
+    return x.clamp_(0, 1)
 
 
 class MediaDataset(Dataset):
@@ -141,6 +131,10 @@ class MediaDataset(Dataset):
         resolution_buckets: list[tuple[int, int, int]],
         reshape_mode: str = "center",
         with_audio: bool = False,
+        temporal_subsample_factor: int = 1,
+        existing_video_shards: set[str] | None = None,
+        existing_audio_shards: set[str] | None = None,
+        filter_existing_shards: bool = False,
         hdr_ingest: bool = False,
         hdr_transfer: str = "auto",
         hdr_synth_bracket_ev: str | None = None,
@@ -154,16 +148,12 @@ class MediaDataset(Dataset):
             resolution_buckets: List of (frames, height, width) tuples
             reshape_mode: How to crop videos ("center", "random")
             with_audio: Whether to extract audio from video files
-            hdr_ingest: If True, decode video to scene-linear float32, store ``hdr_latent`` when
-                computing latents, and tone-map for VAE input.
-            hdr_transfer: Color transfer for HDR linearization when ``hdr_ingest`` is True
-                (``auto`` inspects the bitstream; ``pq`` / ``hlg`` / ``srgb`` / ``linear`` override).
-            hdr_synth_bracket_ev: If set (e.g. ``"-7:5:1"``), save a LatentHDR-style γ-encoded synthetic
-                LDR stack ``hdr_ldr_ev_stack`` ``[N,C,F,H,W]`` alongside ``hdr_latent`` (requires ``hdr_ingest``).
-            hdr_vae_encoding: When ``hdr_ingest`` is True, how to map scene-linear frames to ``[0,1]`` before the
-                VAE's ``[-1,1]`` normalize: ``reinhard`` (default), ``pu21`` (X2HDR, peak→4000 cd/m² then PU21),
-                ``logc3`` (LumiVid / arXiv:2604.11788 — ARRI LogC3 via ``ltx_core.hdr.LogC3``, no peak rescale), or
-                ``lf_log1p`` (LF-Diff / arXiv:2404.00849 — ``log(1+μ x)/log(1+μ)``, ``μ=5000``).
+            temporal_subsample_factor: Factor for VAE-aligned temporal subsampling.
+                When > 1, keeps frame 0 then takes every Nth frame from frame 1 onwards.
+            hdr_ingest: If True, decode video to scene-linear float32 and store ``hdr_latent``.
+            hdr_transfer: Color transfer for HDR linearization when ``hdr_ingest`` is True.
+            hdr_synth_bracket_ev: Optional EV bracket spec for synthetic LDR stack (requires hdr_ingest).
+            hdr_vae_encoding: Tone-map / VAE input encoding when hdr_ingest is True.
         """
         super().__init__()
 
@@ -172,6 +162,10 @@ class MediaDataset(Dataset):
         self.resolution_buckets = resolution_buckets
         self.reshape_mode = reshape_mode
         self.with_audio = with_audio
+        self.temporal_subsample_factor = temporal_subsample_factor
+        self.existing_video_shards = existing_video_shards or set()
+        self.existing_audio_shards = existing_audio_shards or set()
+        self.filter_existing_shards = filter_existing_shards
         self.hdr_ingest = hdr_ingest
         self.hdr_transfer = hdr_transfer
         self.hdr_synth_bracket_ev = hdr_synth_bracket_ev
@@ -183,13 +177,10 @@ class MediaDataset(Dataset):
             )
         self.hdr_vae_encoding = hve
 
-        # First load main media paths (resolved on disk) and manifest-relative keys for output layout
-        self.main_media_paths, self.main_media_relpaths = self._load_video_paths_with_relpaths(main_media_column)
+        # Manifest-relative paths (e.g. ltx_manifest/clips/foo.mp4) drive latent shard layout.
+        self.main_media_paths, self.main_media_relpaths = self._load_media_column(main_media_column)
+        self.video_paths, self.video_relpaths = self._load_media_column(video_column)
 
-        # Then load reference / alternate video paths
-        self.video_paths, self.video_relpaths = self._load_video_paths_with_relpaths(video_column)
-
-        # Filter out videos with insufficient frames
         self._filter_valid_videos()
 
         self.max_target_frames = max(self.resolution_buckets, key=lambda x: x[0])[0]
@@ -197,7 +188,7 @@ class MediaDataset(Dataset):
         # Set up video transforms
         self.transforms = transforms.Compose(
             [
-                transforms.Lambda(_clamp_tensor_01_inplace),
+                transforms.Lambda(_clamp_01),
                 transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5], inplace=True),
             ]
         )
@@ -212,14 +203,18 @@ class MediaDataset(Dataset):
             return index
 
         video_path: Path = self.video_paths[index]
+        relative_path = str(self.video_relpaths[index])
+        media_relative_path = str(self.main_media_relpaths[index])
 
-        media_relative_path = self.main_media_relpaths[index]
-        relative_path = self.video_relpaths[index]
-
-        if is_still_image_path(video_path):
+        if video_path.suffix.lower() in [".png", ".jpg", ".jpeg"]:
             media_tensor = self._preprocess_image(video_path)
             fps = 1.0
             audio_data = None  # Images don't have audio
+            hdr_latent = None
+            hdr_meta_u8 = None
+            hdr_ldr_ev_stack = None
+        elif self.audio_only_rows[index]:
+            media_tensor, fps, audio_data = self._load_audio_only_item(video_path)
             hdr_latent = None
             hdr_meta_u8 = None
             hdr_ldr_ev_stack = None
@@ -265,115 +260,85 @@ class MediaDataset(Dataset):
 
     @staticmethod
     def _extract_audio(video_path: Path, target_duration: float) -> dict[str, torch.Tensor | int] | None:
-        """Extract audio track from a video file, trimmed to match video duration."""
-        try:
-            # torchaudio can extract audio from video files directly
-            # waveform shape: [channels, samples]
-            waveform, sample_rate = torchaudio.load(str(video_path))
-
-            # Trim or pad to target duration
-            target_samples = int(target_duration * sample_rate)
-            current_samples = waveform.shape[-1]
-
-            if current_samples > target_samples:
-                # Trim to target duration
-                waveform = waveform[..., :target_samples]
-            elif current_samples < target_samples:
-                # Pad with zeros to target duration
-                padding = target_samples - current_samples
-                waveform = torch.nn.functional.pad(waveform, (0, padding))
-                logger.warning(f"Padded audio to {target_duration:.2f} seconds for {video_path}")
-
-            return {"waveform": waveform, "sample_rate": sample_rate}
-
-        except Exception as e:
-            logger.debug(f"Could not extract audio from {video_path}: {e}")
+        """Extract audio track from a video file, trimmed/padded to match video duration."""
+        audio = _load_audio_from_file(video_path, max_duration=target_duration)
+        if audio is None:
             return None
 
-    def _load_video_paths_with_relpaths(self, column: str) -> tuple[list[Path], list[str]]:
-        """Load resolved filesystem paths and manifest-relative POSIX paths for output naming."""
-        if self.dataset_file.suffix == ".csv":
-            return self._load_video_paths_from_csv(column)
-        elif self.dataset_file.suffix == ".json":
-            return self._load_video_paths_from_json(column)
-        elif self.dataset_file.suffix == ".jsonl":
-            return self._load_video_paths_from_jsonl(column)
+        # Pad if shorter than target (_load_audio_from_file only trims, doesn't pad)
+        target_samples = int(target_duration * audio.sampling_rate)
+        if audio.waveform.shape[-1] < target_samples:
+            padding = target_samples - audio.waveform.shape[-1]
+            waveform = torch.nn.functional.pad(audio.waveform, (0, padding))
+            logger.warning(f"Padded audio to {target_duration:.2f} seconds for {video_path}")
         else:
-            raise ValueError("Expected `dataset_file` to be a path to a CSV, JSON, or JSONL file.")
+            waveform = audio.waveform
 
-    def _load_video_paths_from_csv(self, column: str) -> tuple[list[Path], list[str]]:
-        """Load video paths from a CSV file."""
-        df = pd.read_csv(self.dataset_file)
-        if column not in df.columns:
-            raise ValueError(f"Column '{column}' not found in CSV file")
+        return {"waveform": waveform, "sample_rate": audio.sampling_rate}
 
-        raw = [str(line).strip() for line in df[column].tolist()]
-        relpaths = [manifest_relative_posix(x) for x in raw]
-        video_paths = [resolve_dataset_media_path(self.dataset_file, x) for x in raw]
+    def _load_media_column(self, column: str) -> tuple[list[Path], list[Path]]:
+        """Load resolved filesystem paths and manifest-relative media paths."""
+        paths, relpaths = _load_media_column_from_dataset(self.dataset_file, column)
+        invalid = [p for p in paths if not p.is_file()]
+        if invalid:
+            raise ValueError(f"Found {len(invalid)} invalid paths in '{column}'. First few: {invalid[:5]}")
+        return paths, relpaths
 
-        invalid_paths = [path for path in video_paths if not path.is_file()]
-        if invalid_paths:
-            raise ValueError(f"Found {len(invalid_paths)} invalid video paths. First few: {invalid_paths[:5]}")
+    def _load_audio_only_item(
+        self, video_path: Path
+    ) -> tuple[torch.Tensor, float, dict[str, torch.Tensor | int] | None]:
+        """Resume audio encode when video latents already exist (skip video decode)."""
+        bucket_frames, target_height, target_width = min(self.resolution_buckets, key=lambda x: x[0])
+        from ltx_trainer.ffmpeg_io import probe_media
 
-        return video_paths, relpaths
-
-    def _load_video_paths_from_json(self, column: str) -> tuple[list[Path], list[str]]:
-        """Load video paths from a JSON file."""
-        with open(self.dataset_file, "r", encoding="utf-8") as file:
-            data = json.load(file)
-
-        if not isinstance(data, list):
-            raise ValueError("JSON file must contain a list of objects")
-
-        raw: list[str] = []
-        for entry in data:
-            if column not in entry:
-                raise ValueError(f"Key '{column}' not found in JSON entry")
-            raw.append(str(entry[column]).strip())
-
-        relpaths = [manifest_relative_posix(x) for x in raw]
-        video_paths = [resolve_dataset_media_path(self.dataset_file, x) for x in raw]
-
-        invalid_paths = [path for path in video_paths if not path.is_file()]
-        if invalid_paths:
-            raise ValueError(f"Found {len(invalid_paths)} invalid video paths. First few: {invalid_paths[:5]}")
-
-        return video_paths, relpaths
-
-    def _load_video_paths_from_jsonl(self, column: str) -> tuple[list[Path], list[str]]:
-        """Load video paths from a JSONL file."""
-        raw: list[str] = []
-        with open(self.dataset_file, "r", encoding="utf-8") as file:
-            for line in file:
-                entry = json.loads(line)
-                if column not in entry:
-                    raise ValueError(f"Key '{column}' not found in JSONL entry")
-                raw.append(str(entry[column]).strip())
-
-        relpaths = [manifest_relative_posix(x) for x in raw]
-        video_paths = [resolve_dataset_media_path(self.dataset_file, x) for x in raw]
-
-        invalid_paths = [path for path in video_paths if not path.is_file()]
-        if invalid_paths:
-            raise ValueError(f"Found {len(invalid_paths)} invalid video paths. First few: {invalid_paths[:5]}")
-
-        return video_paths, relpaths
+        probe = probe_media(video_path)
+        fps = probe.video.avg_fps if probe.video else 24.0
+        frame_count = get_video_frame_count(video_path)
+        effective_frames = max(1, min(frame_count, bucket_frames))
+        target_duration = effective_frames / max(fps, 1e-6)
+        audio_data = self._extract_audio(video_path, target_duration) if self.with_audio else None
+        media_tensor = torch.zeros(3, bucket_frames, target_height, target_width)
+        return media_tensor, fps, audio_data
 
     def _filter_valid_videos(self) -> None:
         """Filter out videos with insufficient frames."""
         original_length = len(self.video_paths)
-        valid_video_paths = []
-        valid_main_media_paths = []
-        valid_video_relpaths = []
-        valid_main_media_relpaths = []
+        valid_video_paths: list[Path] = []
+        valid_video_relpaths: list[Path] = []
+        valid_main_media_paths: list[Path] = []
+        valid_main_media_relpaths: list[Path] = []
+        audio_only_rows: list[bool] = []
         min_frames_required = min(self.resolution_buckets, key=lambda x: x[0])[0]
 
         for i, video_path in enumerate(self.video_paths):
-            if is_still_image_path(video_path):
+            if self.filter_existing_shards and self.existing_video_shards:
+                if _latent_shard_done(
+                    self.main_media_relpaths[i],
+                    existing_video=self.existing_video_shards,
+                    existing_audio=self.existing_audio_shards,
+                    require_audio=self.with_audio,
+                ):
+                    continue
+
+                if _latent_shard_done(
+                    self.main_media_relpaths[i],
+                    existing_video=self.existing_video_shards,
+                    existing_audio=self.existing_audio_shards,
+                    require_audio=False,
+                ):
+                    valid_video_paths.append(video_path)
+                    valid_video_relpaths.append(self.video_relpaths[i])
+                    valid_main_media_paths.append(self.main_media_paths[i])
+                    valid_main_media_relpaths.append(self.main_media_relpaths[i])
+                    audio_only_rows.append(True)
+                    continue
+
+            if video_path.suffix.lower() in [".png", ".jpg", ".jpeg"]:
                 valid_video_paths.append(video_path)
-                valid_main_media_paths.append(self.main_media_paths[i])
                 valid_video_relpaths.append(self.video_relpaths[i])
+                valid_main_media_paths.append(self.main_media_paths[i])
                 valid_main_media_relpaths.append(self.main_media_relpaths[i])
+                audio_only_rows.append(False)
                 continue
 
             try:
@@ -381,9 +346,10 @@ class MediaDataset(Dataset):
 
                 if frame_count >= min_frames_required:
                     valid_video_paths.append(video_path)
-                    valid_main_media_paths.append(self.main_media_paths[i])
                     valid_video_relpaths.append(self.video_relpaths[i])
+                    valid_main_media_paths.append(self.main_media_paths[i])
                     valid_main_media_relpaths.append(self.main_media_relpaths[i])
+                    audio_only_rows.append(False)
                 else:
                     logger.warning(
                         f"Skipping video at {video_path} - has {frame_count} frames, "
@@ -392,16 +358,20 @@ class MediaDataset(Dataset):
             except Exception as e:
                 logger.warning(f"Failed to read video at {video_path}: {e!s}")
 
-        # Update both path lists to maintain synchronization
+        # Update path lists to maintain synchronization
         self.video_paths = valid_video_paths
-        self.main_media_paths = valid_main_media_paths
         self.video_relpaths = valid_video_relpaths
+        self.main_media_paths = valid_main_media_paths
         self.main_media_relpaths = valid_main_media_relpaths
+        self.audio_only_rows = audio_only_rows
 
-        if len(self.video_paths) < original_length:
+        dropped = original_length - len(self.video_paths)
+        if dropped:
+            audio_only_count = sum(audio_only_rows)
             logger.warning(
-                f"Filtered out {original_length - len(self.video_paths)} videos with insufficient frames. "
-                f"Proceeding with {len(self.video_paths)} valid videos."
+                f"Filtered dataset from {original_length} to {len(self.video_paths)} rows "
+                f"({dropped} dropped: insufficient frames and/or existing shards complete; "
+                f"{audio_only_count} audio-only resume)."
             )
 
     def _preprocess_image(self, path: Path) -> torch.Tensor:
@@ -439,6 +409,9 @@ class MediaDataset(Dataset):
             target_num_frames, target_height, target_width = nearest_bucket
             frames_linear = self._resize_and_crop(video_linear, target_height, target_width)
             frames_linear = frames_linear[:target_num_frames]
+            if self.temporal_subsample_factor > 1:
+                indices = _compute_temporal_subsample_indices(target_num_frames, self.temporal_subsample_factor)
+                frames_linear = frames_linear[indices]
             hdr_latent = frames_linear.permute(1, 0, 2, 3).contiguous().to(torch.float32)
 
             if self.hdr_vae_encoding == "pu21":
@@ -485,6 +458,11 @@ class MediaDataset(Dataset):
 
         # Trim video to target number of frames
         frames_resized = frames_resized[:target_num_frames]
+
+        # VAE-aligned temporal subsampling: keep frame 0, then every Nth frame
+        if self.temporal_subsample_factor > 1:
+            indices = _compute_temporal_subsample_indices(target_num_frames, self.temporal_subsample_factor)
+            frames_resized = frames_resized[indices]
 
         # Apply transforms to each frame and stack
         video = torch.stack([self.transforms(frame) for frame in frames_resized], dim=0)
@@ -572,7 +550,18 @@ class MediaDataset(Dataset):
         return media_tensor
 
 
-def compute_latents(  # noqa: PLR0913, PLR0915
+def _compute_temporal_subsample_indices(num_frames: int, factor: int) -> list[int]:
+    """Compute VAE-aligned temporal subsample indices.
+    Keeps frame 0 (the VAE's standalone first-frame latent), then takes every
+    ``factor``-th frame from frame 1 onwards.  This ensures each resulting
+    8-frame VAE group spans ``factor`` groups of the original video.
+    """
+    if factor == 1:
+        return list(range(num_frames))
+    return [0, *list(range(1, num_frames, factor))]
+
+
+def compute_latents(  # noqa: PLR0912, PLR0913, PLR0915
     dataset_file: str | Path,
     video_column: str,
     resolution_buckets: list[tuple[int, int, int]],
@@ -585,15 +574,22 @@ def compute_latents(  # noqa: PLR0913, PLR0915
     vae_tiling: bool = False,
     with_audio: bool = False,
     audio_output_dir: str | None = None,
+    num_dataloader_workers: int = 4,
+    overwrite: bool = False,
+    temporal_subsample_factor: int = 1,
     hdr_ingest: bool = False,
     hdr_transfer: str = "auto",
     hdr_synth_bracket_ev: str | None = None,
     hdr_vae_encoding: str = "reinhard",
-    latent_save_dtype: torch.dtype = torch.float32,
+    latent_save_dtype: torch.dtype | None = None,
     skip_existing: bool = False,
 ) -> None:
     """
     Process videos and save latent representations.
+    Under ``accelerate launch``, each process handles an interleaved shard of
+    the dataset (rank/world read from ``accelerate.PartialState``). Already-
+    computed ``.pt`` outputs are skipped unless ``overwrite=True``; writes are
+    atomic so an interrupted run is safe to resume.
     Args:
         dataset_file: Path to metadata file (CSV/JSON/JSONL) containing video paths
         video_column: Column name for video paths in the metadata file
@@ -607,17 +603,20 @@ def compute_latents(  # noqa: PLR0913, PLR0915
         vae_tiling: Whether to enable VAE tiling
         with_audio: Whether to extract and encode audio from videos
         audio_output_dir: Directory to save audio latents (required if with_audio=True)
-        hdr_ingest: Decode to scene-linear float32, save ``hdr_latent`` in each ``.pt``, tone-map for VAE
-        hdr_transfer: ``auto``, ``pq``, ``hlg``, ``srgb``, or ``linear`` (see ``ltx_trainer.hdr_ingest``)
-        hdr_synth_bracket_ev: Optional ``"ev_min:ev_max:step"`` (e.g. ``"-7:5:1"``) to save ``hdr_ldr_ev_stack``
-            (LatentHDR Appendix A synthetic γ-LDR stack). Requires ``hdr_ingest=True``.
-        hdr_vae_encoding: ``reinhard`` (default), ``pu21`` (X2HDR), ``logc3`` (LumiVid), or ``lf_log1p`` (LF-Diff tonemap).
-            Requires ``hdr_ingest=True`` when not ``reinhard``.
-        latent_save_dtype: Dtype for stored VAE ``latents`` tensors (default float32)
+        num_dataloader_workers: Number of DataLoader worker processes (0 for in-process loading)
+        overwrite: Re-process every item even if its output exists. Use when rerunning with
+            changed parameters (different model, resolution, etc.) so stale outputs are replaced.
+        temporal_subsample_factor: Factor for VAE-aligned temporal subsampling of reference videos
+        hdr_ingest: HDR scene-linear ingest; saves ``hdr_latent`` per clip when True
+        hdr_transfer: ``auto``, ``pq``, ``hlg``, ``srgb``, or ``linear`` for HDR decode
+        hdr_synth_bracket_ev: Optional ``"ev_min:ev_max:step"`` for ``hdr_ldr_ev_stack`` (requires hdr_ingest)
+        hdr_vae_encoding: ``reinhard``, ``pu21``, ``logc3``, or ``lf_log1p`` when hdr_ingest is True
+        skip_existing: Skip shards whose output ``.pt`` already exists (maps to ``overwrite=False``)
     """
-    # Validate audio parameters
-    if with_audio and audio_output_dir is None:
-        raise ValueError("audio_output_dir must be provided when with_audio=True")
+    if skip_existing:
+        overwrite = False
+    if latent_save_dtype is not None:
+        logger.debug("latent_save_dtype=%s ignored (kino encode uses float32 latents)", latent_save_dtype)
 
     if hdr_synth_bracket_ev and not hdr_ingest:
         raise ValueError("hdr_synth_bracket_ev requires hdr_ingest=True")
@@ -635,11 +634,47 @@ def compute_latents(  # noqa: PLR0913, PLR0915
     if hdr_synth_bracket_ev:
         emin, emax, estep = parse_ev_bracket_spec(hdr_synth_bracket_ev)
         _ev_list_for_save = ev_list_arange(emin, emax, estep)
+    # Validate temporal subsampling compatibility with resolution buckets
+    if temporal_subsample_factor > 1:
+        for frames, _h, _w in resolution_buckets:
+            pixel_frames_minus_one = frames - 1
+            if pixel_frames_minus_one % temporal_subsample_factor != 0:
+                raise ValueError(
+                    f"Frame count {frames} is not compatible with "
+                    f"temporal_subsample_factor={temporal_subsample_factor}. "
+                    f"(frames - 1) must be divisible by the factor."
+                )
+            subsampled = 1 + pixel_frames_minus_one // temporal_subsample_factor
+            if (subsampled - 1) % VAE_TEMPORAL_FACTOR != 0:
+                raise ValueError(
+                    f"After temporal subsampling {frames} → {subsampled} frames, "
+                    f"result does not satisfy (frames - 1) % {VAE_TEMPORAL_FACTOR} == 0."
+                )
+
+    if with_audio and audio_output_dir is None:
+        raise ValueError("audio_output_dir must be provided when with_audio=True")
 
     console = Console()
     torch_device = torch.device(device)
 
-    # Create dataset
+    output_path = Path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+
+    audio_output_path: Path | None = None
+    if with_audio:
+        audio_output_path = Path(audio_output_dir)
+        audio_output_path.mkdir(parents=True, exist_ok=True)
+
+    env_workers = os.environ.get("GOPEX_VAE_DATALOADER_WORKERS", "").strip()
+    if env_workers:
+        num_dataloader_workers = int(env_workers)
+    elif with_audio and num_dataloader_workers > 0:
+        num_dataloader_workers = 0
+
+    existing_video = _collect_existing_shards(output_path)
+    existing_audio = _collect_existing_shards(audio_output_path) if audio_output_path else set()
+    shard_filter = skip_existing and not overwrite
+
     dataset = MediaDataset(
         dataset_file=dataset_file,
         main_media_column=main_media_column or video_column,
@@ -647,6 +682,10 @@ def compute_latents(  # noqa: PLR0913, PLR0915
         resolution_buckets=resolution_buckets,
         reshape_mode=reshape_mode,
         with_audio=with_audio,
+        temporal_subsample_factor=temporal_subsample_factor,
+        existing_video_shards=existing_video if shard_filter else None,
+        existing_audio_shards=existing_audio if shard_filter else None,
+        filter_existing_shards=shard_filter,
         hdr_ingest=hdr_ingest,
         hdr_transfer=hdr_transfer,
         hdr_synth_bracket_ev=hdr_synth_bracket_ev,
@@ -657,46 +696,59 @@ def compute_latents(  # noqa: PLR0913, PLR0915
     if hdr_ingest:
         if hve == "pu21":
             logger.info(
-                "HDR ingest enabled: scene-linear float32 ``hdr_latent`` in each .pt; VAE input uses X2HDR PU21 "
-                "(per-clip peak → 4000 cd/m², see ``hdr_meta`` ``x2hdr``). "
-                "Stored ``latents`` are LTX VAE encoder outputs (posterior mean / normalized), matching LatentHDR-style μ supervision."
+                "HDR ingest enabled: scene-linear float32 ``hdr_latent`` in each .pt; VAE input uses X2HDR PU21."
             )
         elif hve == "logc3":
             logger.info(
-                "HDR ingest enabled: scene-linear float32 ``hdr_latent`` in each .pt; VAE input uses LumiVid LogC3 "
-                "(``ltx_core.hdr.LogC3``, see ``hdr_meta`` ``lumivid``). "
-                "Stored ``latents`` are LTX VAE encoder outputs (posterior mean / normalized), matching LatentHDR-style μ supervision."
+                "HDR ingest enabled: scene-linear float32 ``hdr_latent`` in each .pt; VAE input uses LumiVid LogC3."
             )
         elif hve == "lf_log1p":
             logger.info(
-                "HDR ingest enabled: scene-linear float32 ``hdr_latent`` in each .pt; VAE input uses LF-Diff log tonemap "
-                "(log(1+μ x)/log(1+μ), μ=5000, see ``hdr_meta`` ``lf_diff``). "
-                "Stored ``latents`` are LTX VAE encoder outputs (posterior mean / normalized), matching LatentHDR-style μ supervision."
+                "HDR ingest enabled: scene-linear float32 ``hdr_latent`` in each .pt; VAE input uses LF-Diff tonemap."
             )
         else:
             logger.info(
-                "HDR ingest enabled: scene-linear float32 ``hdr_latent`` in each .pt; VAE input uses Reinhard tone-map. "
-                "Stored ``latents`` are LTX VAE encoder outputs (posterior mean / normalized), matching LatentHDR-style μ supervision."
+                "HDR ingest enabled: scene-linear float32 ``hdr_latent`` in each .pt; VAE input uses Reinhard tone-map."
             )
         if hdr_synth_bracket_ev:
             logger.info(
                 f"Synthetic γ-encoded LDR EV stack enabled ({hdr_synth_bracket_ev}); see ``hdr_ldr_ev_stack`` in each .pt."
             )
 
-    output_path = Path(output_dir)
-    output_path.mkdir(parents=True, exist_ok=True)
+    # Audio processing requires batch_size=1; must be applied before the dataloader is built.
+    if with_audio and batch_size > 1:
+        logger.warning("Audio processing requires batch_size=1. Overriding batch_size to 1.")
+        batch_size = 1
 
-    # Set up audio output directory if needed
-    audio_output_path = None
-    if with_audio:
-        audio_output_path = Path(audio_output_dir)
-        audio_output_path.mkdir(parents=True, exist_ok=True)
+    def _is_done(idx: int) -> bool:
+        return _latent_shard_done(
+            dataset.main_media_relpaths[idx],
+            existing_video=existing_video,
+            existing_audio=existing_audio,
+            require_audio=with_audio,
+        )
 
-    # Load video VAE encoder
+    if skip_existing and not overwrite:
+        skipped = sum(1 for i in range(len(dataset)) if _is_done(i))
+        remaining = len(dataset) - skipped
+        logger.info(
+            f"skip_existing prefilter: {skipped:,} latent shards already on disk; "
+            f"{remaining:,} media files remain"
+        )
+
+    dataloader = _build_sharded_dataloader(
+        dataset,
+        batch_size=batch_size,
+        num_workers=num_dataloader_workers,
+        is_done=_is_done,
+        overwrite=overwrite,
+    )
+    if dataloader is None:
+        return
+
     with console.status(f"[bold]Loading video VAE encoder from [cyan]{model_path}[/]...", spinner="dots"):
         vae = load_video_vae_encoder(model_path, device=torch_device, dtype=torch.bfloat16)
 
-    # Load audio VAE encoder and audio processor if needed
     audio_vae_encoder = None
     audio_processor = None
     if with_audio:
@@ -706,7 +758,6 @@ def compute_latents(  # noqa: PLR0913, PLR0915
                 device=torch_device,
                 dtype=torch.float32,  # Audio VAE needs float32 for quality. TODO: re-test with bfloat16.
             )
-            # Create audio processor for waveform-to-spectrogram conversion
             audio_processor = AudioProcessor(
                 target_sample_rate=audio_vae_encoder.sample_rate,
                 mel_bins=audio_vae_encoder.mel_bins,
@@ -714,20 +765,9 @@ def compute_latents(  # noqa: PLR0913, PLR0915
                 n_fft=audio_vae_encoder.n_fft,
             ).to(torch_device)
 
-    # Create dataloader
-    # Note: batch_size=1 required when with_audio because audio extraction can fail for some videos,
-    # and the default collate function can't handle mixed None/dict values across a batch.
-    if with_audio and batch_size > 1:
-        logger.warning("Audio processing requires batch_size=1. Overriding batch_size to 1.")
-        batch_size = 1
-    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=4)
-
     # Track audio statistics
     audio_success_count = 0
     audio_skip_count = 0
-    skipped_latents = 0
-    if skip_existing:
-        logger.info("skip_existing enabled — latent shards already on disk will be skipped")
 
     # Process batches
     with Progress(
@@ -744,60 +784,87 @@ def compute_latents(  # noqa: PLR0913, PLR0915
 
         for batch in dataloader:
             batch_size_now = len(batch["relative_path"])
-            pending: list[tuple[int, Path]] = []
-            skip_batch = skip_existing and batch_size_now > 0
+            pending_rel: list[Path] = []
+            skip_batch = skip_existing and batch_size_now > 0 and not overwrite
             for i in range(batch_size_now):
                 output_rel_path = Path(batch["main_media_relative_path"][i]).with_suffix(".pt")
-                output_file = output_path / output_rel_path
-                pending.append((i, output_file))
-                if not (skip_existing and output_file.is_file() and output_file.stat().st_size > 0):
+                pending_rel.append(output_rel_path)
+                video_file = _resolve_existing_shard(output_path, output_rel_path, existing_video)
+                audio_file = (
+                    _resolve_existing_shard(audio_output_path, output_rel_path, existing_audio)
+                    if audio_output_path is not None
+                    else None
+                )
+                video_ok = video_file is not None
+                audio_ok = audio_output_path is None or audio_file is not None
+                if not (skip_existing and video_ok and audio_ok):
                     skip_batch = False
             if skip_batch:
-                skipped_latents += batch_size_now
                 progress.advance(task)
                 continue
 
             # Get video tensor - shape is [B, F, C, H, W] from DataLoader
             video = batch["video"]
 
-            # Encode video
-            with torch.inference_mode():
-                video_latent_data = encode_video(
-                    vae=vae,
-                    video=video,
-                    use_tiling=vae_tiling,
-                    dtype=latent_save_dtype,
+            need_video_encode = True
+            if skip_existing and batch_size_now == 1 and not overwrite:
+                video_file = _resolve_existing_shard(output_path, pending_rel[0], existing_video)
+                audio_file = (
+                    _resolve_existing_shard(audio_output_path, pending_rel[0], existing_audio)
+                    if audio_output_path is not None
+                    else None
                 )
+                if video_file is not None and (
+                    audio_output_path is None or audio_file is not None
+                ):
+                    progress.advance(task)
+                    continue
+                need_video_encode = video_file is None
+
+            video_latent_data = None
+            if need_video_encode:
+                with torch.inference_mode():
+                    video_latent_data = _encode_video(vae=vae, video=video, use_tiling=vae_tiling)
 
             # Save latents for each item in batch
-            for i in range(len(batch["relative_path"])):
-                output_rel_path = Path(batch["main_media_relative_path"][i]).with_suffix(".pt")
-                output_file = output_path / output_rel_path
+            for i in range(batch_size_now):
+                output_rel_path = pending_rel[i]
+                output_file = _canonical_shard_path(output_path, output_rel_path)
+                video_file = _resolve_existing_shard(output_path, output_rel_path, existing_video)
 
                 # Create output directory maintaining structure
                 output_file.parent.mkdir(parents=True, exist_ok=True)
 
-                # Index into batch to get this item's latents
-                latent_data: dict[str, Any] = {
-                    "latents": video_latent_data["latents"][i].cpu().contiguous(),
-                    "num_frames": video_latent_data["num_frames"],
-                    "height": video_latent_data["height"],
-                    "width": video_latent_data["width"],
-                    "fps": batch["video_metadata"]["fps"][i].item(),
-                    "latent_save_dtype": str(latent_save_dtype).replace("torch.", ""),
-                }
+                if video_latent_data is not None:
+                    # Store the latent's effective fps (= source_fps / subsample factor).
+                    # Downstream position math expects the rate the saved latents actually have.
+                    effective_fps = batch["video_metadata"]["fps"][i].item() / temporal_subsample_factor
+                    latent_data = {
+                        "latents": video_latent_data["latents"][i].cpu().contiguous(),  # [C, F', H', W']
+                        "num_frames": video_latent_data["num_frames"],
+                        "height": video_latent_data["height"],
+                        "width": video_latent_data["width"],
+                        "fps": effective_fps,
+                    }
+                    if batch.get("hdr_latent") is not None and batch.get("hdr_meta_u8") is not None:
+                        latent_data["hdr_latent"] = batch["hdr_latent"][i].cpu().contiguous()
+                        latent_data["hdr_meta"] = padded_u8_to_hdr_meta_dict(batch["hdr_meta_u8"][i].cpu())
+                        if batch.get("hdr_ldr_ev_stack") is not None and _ev_list_for_save is not None:
+                            latent_data["hdr_ldr_ev_stack"] = batch["hdr_ldr_ev_stack"][i].cpu().contiguous()
+                            latent_data["hdr_ev_list"] = _ev_list_for_save
 
-                if batch.get("hdr_latent") is not None and batch.get("hdr_meta_u8") is not None:
-                    latent_data["hdr_latent"] = batch["hdr_latent"][i].cpu().contiguous()
-                    latent_data["hdr_meta"] = padded_u8_to_hdr_meta_dict(batch["hdr_meta_u8"][i].cpu())
-                    if batch.get("hdr_ldr_ev_stack") is not None and _ev_list_for_save is not None:
-                        latent_data["hdr_ldr_ev_stack"] = batch["hdr_ldr_ev_stack"][i].cpu().contiguous()
-                        latent_data["hdr_ev_list"] = _ev_list_for_save
-
-                torch.save(latent_data, output_file)
+                    _atomic_save(latent_data, output_file)
+                    existing_video.add(_shard_key(output_rel_path))
+                    existing_video.update(_shard_alias_keys(output_rel_path))
 
                 # Process audio if enabled (audio is already extracted by the dataset)
                 if with_audio:
+                    audio_output_file = _canonical_shard_path(audio_output_path, output_rel_path)
+                    audio_file = _resolve_existing_shard(
+                        audio_output_path, output_rel_path, existing_audio
+                    )
+                    if audio_file is not None:
+                        continue
                     audio_batch = batch.get("audio")
                     if audio_batch is not None:
                         # Extract the i-th item from batched audio data
@@ -809,10 +876,9 @@ def compute_latents(  # noqa: PLR0913, PLR0915
 
                         # Encode audio
                         with torch.inference_mode():
-                            audio_latents = encode_audio(audio_vae_encoder, audio_processor, audio_data)
+                            audio_latents = _encode_audio(audio_vae_encoder, audio_processor, audio_data)
 
                         # Save audio latents
-                        audio_output_file = audio_output_path / output_rel_path
                         audio_output_file.parent.mkdir(parents=True, exist_ok=True)
 
                         audio_save_data = {
@@ -822,7 +888,9 @@ def compute_latents(  # noqa: PLR0913, PLR0915
                             "duration": audio_latents["duration"],
                         }
 
-                        torch.save(audio_save_data, audio_output_file)
+                        _atomic_save(audio_save_data, audio_output_file)
+                        existing_audio.add(_shard_key(output_rel_path))
+                        existing_audio.update(_shard_alias_keys(output_rel_path))
                         audio_success_count += 1
                     else:
                         # Video has no audio track
@@ -830,11 +898,7 @@ def compute_latents(  # noqa: PLR0913, PLR0915
 
             progress.advance(task)
 
-    # Log summary
-    msg = f"Processed {len(dataset)} videos. Latents saved to {output_path}"
-    if skip_existing and skipped_latents:
-        msg += f" ({skipped_latents:,} latent shards skipped — already on disk)"
-    logger.info(msg)
+    logger.info(f"Processed {len(dataloader.dataset)} videos -> {output_path}")  # type: ignore[arg-type]
     if with_audio:
         logger.info(
             f"Audio processing: {audio_success_count} videos with audio, "
@@ -842,7 +906,7 @@ def compute_latents(  # noqa: PLR0913, PLR0915
         )
 
 
-def encode_video(
+def _encode_video(
     vae: torch.nn.Module,
     video: torch.Tensor,
     dtype: torch.dtype | None = None,
@@ -879,7 +943,7 @@ def encode_video(
 
     # Choose encoding method based on tiling flag
     if use_tiling:
-        latents = tiled_encode_video(
+        latents = _tiled_encode_video(
             vae=vae,
             video=video,
             tile_size=tile_size,
@@ -902,7 +966,7 @@ def encode_video(
     }
 
 
-def tiled_encode_video(  # noqa: PLR0912, PLR0915
+def _tiled_encode_video(  # noqa: PLR0912, PLR0915
     vae: torch.nn.Module,
     video: torch.Tensor,
     tile_size: int = DEFAULT_TILE_SIZE,
@@ -1057,7 +1121,7 @@ def tiled_encode_video(  # noqa: PLR0912, PLR0915
     return output
 
 
-def encode_audio(
+def _encode_audio(
     audio_vae_encoder: torch.nn.Module,
     audio_processor: torch.nn.Module,
     audio: Audio,
@@ -1085,6 +1149,35 @@ def encode_audio(
     if waveform.dim() == 2:
         waveform = waveform.unsqueeze(0)
 
+    # Convert to stereo if needed (audio VAE expects 2 channels)
+    # Channel order for surround: 5.1=[L,R,C,LFE,Ls,Rs], 7.1=[L,R,C,LFE,Ls,Rs,Lb,Rb]
+    num_channels = waveform.shape[1]
+    if num_channels == 1:
+        # Mono to stereo: duplicate the channel
+        waveform = waveform.repeat(1, 2, 1)
+    elif num_channels == 6:
+        # 5.1 downmix with normalized weights (sum to 1.0)
+        # Original: L = L + 0.707*C + 0.707*Ls, weights sum = 2.414
+        w_main = 1.0 / 2.414  # ~0.414
+        w_other = 0.707 / 2.414  # ~0.293
+        left = w_main * waveform[:, 0, :] + w_other * waveform[:, 2, :] + w_other * waveform[:, 4, :]
+        right = w_main * waveform[:, 1, :] + w_other * waveform[:, 2, :] + w_other * waveform[:, 5, :]
+        waveform = torch.stack([left, right], dim=1)
+    elif num_channels == 8:
+        # 7.1 downmix with normalized weights (sum to 1.0)
+        # Original: L = L + 0.707*C + 0.707*Ls + 0.707*Lb, weights sum = 3.121
+        w_main = 1.0 / 3.121  # ~0.320
+        w_other = 0.707 / 3.121  # ~0.227
+        center = waveform[:, 2, :]
+        left = w_main * waveform[:, 0, :] + w_other * (center + waveform[:, 4, :] + waveform[:, 6, :])
+        right = w_main * waveform[:, 1, :] + w_other * (center + waveform[:, 5, :] + waveform[:, 7, :])
+        waveform = torch.stack([left, right], dim=1)
+    elif num_channels > 2:
+        # Unknown layout: average all channels to mono, then duplicate to stereo
+        logger.warning(f"Unknown audio channel layout ({num_channels} channels), using mean downmix")
+        mono = waveform.mean(dim=1, keepdim=True)
+        waveform = mono.repeat(1, 2, 1)
+
     # Calculate duration
     duration = waveform.shape[-1] / audio.sampling_rate
 
@@ -1104,6 +1197,492 @@ def encode_audio(
         "frequency_bins": freq_bins,
         "duration": duration,
     }
+
+
+AUDIO_FILE_EXTENSIONS = {".wav", ".mp3", ".flac", ".ogg", ".aac", ".m4a"}
+VIDEO_FILE_EXTENSIONS = {".mp4", ".avi", ".mov", ".mkv", ".webm"}
+IMAGE_FILE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".heic", ".heif", ".bmp", ".tiff", ".webp"}
+
+
+def compute_video_masks(
+    dataset_file: str | Path,
+    mask_column: str,
+    latents_dir: str,
+    output_dir: str,
+    main_media_column: str | None = None,
+    overwrite: bool = False,
+) -> None:
+    """Preprocess video mask files to latent-space binary masks.
+    For each sample, loads the mask video/image, applies the same spatial
+    resize/crop as the target video (read from saved latent metadata), downsamples
+    to latent dimensions, binarizes, and saves as a .pt tensor.
+    Args:
+        dataset_file: Path to metadata file (CSV/JSON/JSONL).
+        mask_column: Column name containing mask video/image paths.
+        latents_dir: Directory containing the target video latents (for reading
+            spatial/temporal metadata to ensure mask alignment).
+        output_dir: Directory to save mask .pt files.
+        main_media_column: Column for output file naming (defaults to mask_column).
+    """
+    dataset_path = Path(dataset_file)
+    data_root = dataset_path.parent
+    latents_path = Path(latents_dir)
+    output_path = Path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+
+    naming_column = main_media_column or mask_column
+    mask_paths = _load_paths_from_dataset(dataset_path, mask_column)
+    naming_paths = _load_paths_from_dataset(dataset_path, naming_column) if naming_column != mask_column else mask_paths
+
+    success = 0
+    for mask_file, naming_file in zip(mask_paths, naming_paths, strict=True):
+        rel_path = _output_relative(naming_file, data_root)
+        latent_file = latents_path / rel_path.with_suffix(".pt")
+        out_file = output_path / rel_path.with_suffix(".pt")
+
+        if not latent_file.exists():
+            logger.warning(f"No target latent found at {latent_file}, skipping mask {mask_file}")
+            continue
+
+        if not overwrite and out_file.is_file():
+            continue
+
+        target_meta = torch.load(latent_file, map_location="cpu", weights_only=True)
+        latent_f = target_meta["num_frames"]
+        latent_h = target_meta["height"]
+        latent_w = target_meta["width"]
+        pixel_h = latent_h * VAE_SPATIAL_FACTOR
+        pixel_w = latent_w * VAE_SPATIAL_FACTOR
+        pixel_f = (latent_f - 1) * VAE_TEMPORAL_FACTOR + 1
+
+        # Load mask as video or image
+        if mask_file.suffix.lower() in IMAGE_FILE_EXTENSIONS:
+            img = to_tensor(open_image_as_srgb(mask_file)).mean(dim=0, keepdim=True)  # [1, H, W]
+            img = tv_resize(img.unsqueeze(0), [pixel_h, pixel_w]).squeeze(0)  # [1, H, W]
+            mask_pixels = img.expand(pixel_f, -1, -1)  # tile across frames → [F, H, W]
+        else:
+            frames, _ = read_video(str(mask_file), max_frames=pixel_f)  # [F, C, H, W]
+            frames = frames[:pixel_f].mean(dim=1)  # grayscale → [F, H, W]
+            frames = torch.nn.functional.interpolate(
+                frames.unsqueeze(1), size=(pixel_h, pixel_w), mode="nearest"
+            ).squeeze(1)  # [F, H, W]
+            mask_pixels = frames
+
+        # Downsample to latent dims: [F, H, W] → [F', H', W']
+        mask_latent = torch.nn.functional.avg_pool2d(mask_pixels.unsqueeze(1), kernel_size=VAE_SPATIAL_FACTOR).squeeze(
+            1
+        )  # [F, H', W'] → spatial done
+        # Temporal: max-pool over groups of VAE_TEMPORAL_FACTOR frames (any masked frame masks the group)
+        f_spatial = mask_latent.shape[0]
+        pad_f = (VAE_TEMPORAL_FACTOR - f_spatial % VAE_TEMPORAL_FACTOR) % VAE_TEMPORAL_FACTOR
+        if pad_f > 0:
+            mask_latent = torch.nn.functional.pad(mask_latent, (0, 0, 0, 0, 0, pad_f))
+        h_prime, w_prime = mask_latent.shape[1], mask_latent.shape[2]
+        mask_latent = mask_latent.reshape(-1, VAE_TEMPORAL_FACTOR, h_prime, w_prime).amax(dim=1)[:latent_f]
+
+        # Binarize
+        mask_latent = (mask_latent > 0.5).float()
+
+        out_file.parent.mkdir(parents=True, exist_ok=True)
+        _atomic_save({"mask": mask_latent}, out_file)
+        success += 1
+
+    logger.info(f"Mask preprocessing complete: {success} masks saved to {output_path}")
+
+
+def compute_audio_masks(
+    dataset_file: str | Path,
+    mask_column: str,
+    audio_latents_dir: str,
+    output_dir: str,
+    main_media_column: str | None = None,
+    overwrite: bool = False,
+) -> None:
+    """Preprocess audio mask files to latent-space binary masks.
+    For each sample, loads the mask (a 1D waveform-like signal or a simple tensor),
+    resamples it to match the target audio latent temporal length, binarizes, and saves.
+    Args:
+        dataset_file: Path to metadata file (CSV/JSON/JSONL).
+        mask_column: Column name containing mask file paths (.wav or .pt).
+        audio_latents_dir: Directory containing the target audio latents (for reading
+            temporal metadata to ensure mask alignment).
+        output_dir: Directory to save mask .pt files.
+        main_media_column: Column for output file naming (defaults to mask_column).
+    """
+    dataset_path = Path(dataset_file)
+    data_root = dataset_path.parent
+    audio_latents_path = Path(audio_latents_dir)
+    output_path = Path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+
+    naming_column = main_media_column or mask_column
+    mask_paths = _load_paths_from_dataset(dataset_path, mask_column)
+    naming_paths = _load_paths_from_dataset(dataset_path, naming_column) if naming_column != mask_column else mask_paths
+
+    success = 0
+    for mask_file, naming_file in zip(mask_paths, naming_paths, strict=True):
+        rel_path = _output_relative(naming_file, data_root)
+        latent_file = audio_latents_path / rel_path.with_suffix(".pt")
+        out_file = output_path / rel_path.with_suffix(".pt")
+
+        if not latent_file.exists():
+            logger.warning(f"No target audio latent found at {latent_file}, skipping mask {mask_file}")
+            continue
+
+        if not overwrite and out_file.is_file():
+            continue
+
+        target_meta = torch.load(latent_file, map_location="cpu", weights_only=True)
+        latent_t = target_meta["num_time_steps"]
+
+        # Load mask: .pt file (raw tensor) or .wav (use amplitude envelope)
+        if mask_file.suffix == ".pt":
+            raw_mask = torch.load(mask_file, map_location="cpu", weights_only=True)
+            if isinstance(raw_mask, dict):
+                raw_mask = raw_mask.get("mask", next(iter(raw_mask.values())))
+            raw_mask = raw_mask.float().flatten()
+        else:
+            audio = _load_audio_from_file(mask_file)
+            if audio is None:
+                logger.warning(f"Could not load audio mask from {mask_file}")
+                continue
+            raw_mask = audio.waveform.abs().mean(dim=0)  # mono amplitude envelope
+
+        # Resample to target audio latent length
+        mask_resampled = torch.nn.functional.interpolate(
+            raw_mask.unsqueeze(0).unsqueeze(0), size=latent_t, mode="nearest"
+        ).squeeze()  # [latent_t]
+
+        mask_binary = (mask_resampled > 0.5).float()
+
+        out_file.parent.mkdir(parents=True, exist_ok=True)
+        _atomic_save({"mask": mask_binary}, out_file)
+        success += 1
+
+    logger.info(f"Audio mask preprocessing complete: {success} masks saved to {output_path}")
+
+
+def compute_audio_latents(  # noqa: PLR0915
+    dataset_file: str | Path,
+    audio_column: str,
+    output_dir: str,
+    model_path: str,
+    main_media_column: str | None = None,
+    max_duration: float | None = None,
+    duration_buckets: list[float] | None = None,
+    device: str = "cuda",
+    overwrite: bool = False,
+) -> None:
+    """Encode audio files into latent representations.
+    Supports standalone audio files (.wav, .mp3, etc.) and audio tracks
+    extracted from video files (.mp4, etc.).
+    Args:
+        dataset_file: Path to metadata file (CSV/JSON/JSONL).
+        audio_column: Column name containing audio file paths.
+        output_dir: Directory to save audio latents.
+        model_path: Path to LTX-2 checkpoint (.safetensors).
+        main_media_column: Column for output file naming (defaults to audio_column).
+            Ensures alignment with other latent directories.
+        max_duration: Maximum audio duration in seconds. Audio is trimmed if longer.
+            Mutually exclusive with duration_buckets.
+        duration_buckets: List of allowed durations in seconds (e.g. [2.0, 4.0, 8.0]).
+            Each audio file is matched to the largest bucket that fits its duration,
+            then trimmed to exactly that length. Files shorter than the smallest
+            bucket are skipped. Ensures uniform lengths for batched training.
+        device: Device to use for computation.
+    """
+    console = Console()
+    torch_device = torch.device(device)
+
+    dataset_path = Path(dataset_file)
+    data_root = dataset_path.parent
+    output_path = Path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+
+    naming_column = main_media_column or audio_column
+    audio_paths = _load_paths_from_dataset(dataset_path, audio_column)
+    naming_paths = (
+        _load_paths_from_dataset(dataset_path, naming_column) if naming_column != audio_column else audio_paths
+    )
+
+    with console.status(f"[bold]Loading audio VAE encoder from [cyan]{model_path}[/]...", spinner="dots"):
+        audio_vae_encoder = load_audio_vae_encoder(
+            checkpoint_path=model_path,
+            device=torch_device,
+            dtype=torch.float32,
+        )
+        audio_processor = AudioProcessor(
+            target_sample_rate=audio_vae_encoder.sample_rate,
+            mel_bins=audio_vae_encoder.mel_bins,
+            mel_hop_length=audio_vae_encoder.mel_hop_length,
+            n_fft=audio_vae_encoder.n_fft,
+        ).to(torch_device)
+
+    sorted_buckets = sorted(duration_buckets, reverse=True) if duration_buckets else None
+    success_count = 0
+    skip_count = 0
+
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(),
+        TaskProgressColumn(),
+        MofNCompleteColumn(),
+        TimeElapsedColumn(),
+        TimeRemainingColumn(),
+        console=console,
+    ) as progress:
+        task = progress.add_task("Encoding audio", total=len(audio_paths))
+
+        for audio_path, naming_path in zip(audio_paths, naming_paths, strict=True):
+            rel_path = _output_relative(naming_path, data_root)
+            output_file = output_path / rel_path.with_suffix(".pt")
+            output_file.parent.mkdir(parents=True, exist_ok=True)
+
+            if not overwrite and output_file.is_file():
+                success_count += 1
+                progress.advance(task)
+                continue
+
+            # Load audio (no trimming yet — need full duration for bucket matching)
+            audio = _load_audio_from_file(audio_path)
+            if audio is None:
+                skip_count += 1
+                progress.advance(task)
+                continue
+
+            file_duration = audio.waveform.shape[-1] / audio.sampling_rate
+
+            # Determine target duration: bucket matching, max_duration cap, or full file
+            target_duration = file_duration
+            if sorted_buckets:
+                bucket = next((b for b in sorted_buckets if b <= file_duration), None)
+                if bucket is None:
+                    logger.warning(
+                        f"Skipping {audio_path.name} ({file_duration:.1f}s) — shorter than "
+                        f"smallest bucket ({sorted_buckets[-1]:.1f}s)"
+                    )
+                    skip_count += 1
+                    progress.advance(task)
+                    continue
+                target_duration = bucket
+            elif max_duration is not None:
+                target_duration = min(file_duration, max_duration)
+
+            # Trim to target duration
+            target_samples = int(target_duration * audio.sampling_rate)
+            trimmed_waveform = audio.waveform[:, :target_samples]
+            audio = Audio(waveform=trimmed_waveform, sampling_rate=audio.sampling_rate)
+
+            with torch.inference_mode():
+                audio_latents = _encode_audio(audio_vae_encoder, audio_processor, audio)
+
+            _atomic_save(
+                {
+                    "latents": audio_latents["latents"].cpu().contiguous(),
+                    "num_time_steps": audio_latents["num_time_steps"],
+                    "frequency_bins": audio_latents["frequency_bins"],
+                    "duration": audio_latents["duration"],
+                },
+                output_file,
+            )
+            success_count += 1
+            progress.advance(task)
+
+    logger.info(f"Audio encoding complete: {success_count} encoded, {skip_count} skipped. Saved to {output_path}")
+
+
+def _output_relative(path: Path, data_root: Path) -> Path:
+    """Relative path used to name a sample's cached output, mirroring the input layout.
+    Normally media lives under the dataset directory and this is just the path relative to it.
+    If a media path is absolute or otherwise outside the dataset directory (e.g. a one-off
+    metadata file that references media elsewhere), mirror its absolute structure under the
+    output directory instead of raising, so out-of-tree media stays collision-free.
+    """
+    try:
+        return path.relative_to(data_root)
+    except ValueError:
+        return Path(*path.parts[1:]) if path.is_absolute() else path
+
+
+def _resolve_dataset_media_path(dataset_file: Path, rel: str) -> Path:
+    """Resolve ``media_path`` from a manifest row.
+
+    Gopex manifests under ``<root>/ltx_manifest/dataset.json`` store paths like
+    ``ltx_manifest/clips/foo.mp4`` or ``data/foo.png`` relative to ``<root>``.
+    Legacy ltx-trainer manifests use paths relative to the manifest file directory.
+    """
+    p = Path(rel.strip())
+    manifest_dir = dataset_file.parent
+    if manifest_dir.name == "ltx_manifest":
+        dataset_root = manifest_dir.parent
+        if p.parts[:1] == ("ltx_manifest",):
+            return dataset_root / p
+        rooted = dataset_root / p
+        legacy = manifest_dir / p
+        if legacy.is_file() and not rooted.is_file():
+            return legacy
+        return rooted
+    if p.parts[:1] == ("ltx_manifest",):
+        return manifest_dir / p
+    return manifest_dir / p
+
+
+resolve_dataset_media_path = _resolve_dataset_media_path
+
+
+def _manifest_media_relpath(media_rel: str) -> Path:
+    """Manifest ``media_path`` value as a Path (keeps ``ltx_manifest/`` prefix when present)."""
+    return Path(media_rel.strip())
+
+
+def _shard_key(rel_pt: Path) -> str:
+    return rel_pt.as_posix()
+
+
+def _shard_alias_keys(rel_pt: Path) -> set[str]:
+    """Legacy layouts: ``clips/foo.pt`` vs ``ltx_manifest/clips/foo.pt``."""
+    parts = rel_pt.parts
+    aliases: set[str] = set()
+    if parts[:1] == ("ltx_manifest",) and len(parts) > 1:
+        aliases.add(Path("clips", *parts[2:]).as_posix())
+    elif parts[:1] == ("clips",):
+        aliases.add(Path("ltx_manifest", *parts).as_posix())
+    return aliases
+
+
+def _canonical_shard_path(root: Path | None, rel_pt: Path) -> Path:
+    if root is None:
+        raise ValueError("output root is required")
+    return root / rel_pt
+
+
+def _collect_existing_shards(root: Path | None) -> set[str]:
+    """One-time scan of ``*.pt`` shards under ``root`` (includes legacy alias keys)."""
+    if root is None or not root.is_dir():
+        return set()
+    found: set[str] = set()
+    for path in root.rglob("*.pt"):
+        if not path.is_file() or path.stat().st_size <= 0:
+            continue
+        try:
+            rel = path.relative_to(root)
+        except ValueError:
+            continue
+        found.add(rel.as_posix())
+        found.update(_shard_alias_keys(rel))
+    return found
+
+
+def _resolve_existing_shard(
+    root: Path | None,
+    rel_pt: Path,
+    existing: set[str],
+) -> Path | None:
+    if root is None:
+        return None
+    for key in (_shard_key(rel_pt), *_shard_alias_keys(rel_pt)):
+        if key in existing:
+            candidate = root / key
+            if candidate.is_file() and candidate.stat().st_size > 0:
+                return candidate
+    return None
+
+
+def _latent_shard_done(
+    media_relpath: Path,
+    *,
+    existing_video: set[str],
+    existing_audio: set[str],
+    require_audio: bool,
+) -> bool:
+    rel_pt = media_relpath.with_suffix(".pt")
+    keys = {_shard_key(rel_pt), *_shard_alias_keys(rel_pt)}
+    if not (keys & existing_video):
+        return False
+    if not require_audio:
+        return True
+    return bool(keys & existing_audio)
+
+
+def _load_media_column_from_dataset(dataset_file: Path, column: str) -> tuple[list[Path], list[Path]]:
+    """Return resolved media paths and manifest-relative paths from a dataset column."""
+
+    def _rows_from_csv() -> list[dict[str, str]]:
+        df = pd.read_csv(dataset_file)
+        if column not in df.columns:
+            raise ValueError(f"Column '{column}' not found in CSV file")
+        return [{column: str(v)} for v in df[column].tolist()]
+
+    def _rows_from_json() -> list[dict[str, str]]:
+        with open(dataset_file, encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, list):
+            raise ValueError("JSON file must contain a list of objects")
+        return data
+
+    def _rows_from_jsonl() -> list[dict[str, str]]:
+        rows: list[dict[str, str]] = []
+        with open(dataset_file, encoding="utf-8") as f:
+            for line in f:
+                rows.append(json.loads(line))
+        return rows
+
+    if dataset_file.suffix == ".csv":
+        rows = _rows_from_csv()
+    elif dataset_file.suffix == ".json":
+        rows = _rows_from_json()
+    elif dataset_file.suffix == ".jsonl":
+        rows = _rows_from_jsonl()
+    else:
+        raise ValueError(f"Unsupported dataset format: {dataset_file.suffix}")
+
+    paths: list[Path] = []
+    relpaths: list[Path] = []
+    for entry in rows:
+        raw = str(entry[column])
+        paths.append(_resolve_dataset_media_path(dataset_file, raw))
+        relpaths.append(_manifest_media_relpath(raw))
+    return paths, relpaths
+
+
+def _load_paths_from_dataset(dataset_file: Path, column: str) -> list[Path]:
+    """Load file paths from a dataset column."""
+    paths, _relpaths = _load_media_column_from_dataset(dataset_file, column)
+    return paths
+
+
+def _load_audio_from_file(audio_path: Path, max_duration: float | None = None) -> Audio | None:
+    """Load audio from an audio or video file, optionally trimming to max_duration."""
+    try:
+        waveform, sample_rate = torchaudio.load(str(audio_path))
+    except Exception:
+        if os.environ.get("GOPEX_LOG_MISSING_AUDIO", "0").strip().lower() in ("1", "true", "yes", "on"):
+            logger.debug(f"Could not load audio from {audio_path}")
+        return None
+
+    if max_duration is not None:
+        max_samples = int(max_duration * sample_rate)
+        if waveform.shape[-1] > max_samples:
+            waveform = waveform[:, :max_samples]
+
+    return Audio(waveform=waveform, sampling_rate=sample_rate)
+
+
+def detect_dataset_columns(dataset_file: str | Path) -> set[str]:
+    """Read column names from a dataset file without loading all data."""
+    path = Path(dataset_file)
+    if path.suffix == ".csv":
+        df = pd.read_csv(path, nrows=0)
+        return set(df.columns)
+    if path.suffix == ".json":
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+        return set(data[0].keys()) if isinstance(data, list) and data else set()
+    if path.suffix == ".jsonl":
+        with open(path, encoding="utf-8") as f:
+            return set(json.loads(f.readline()).keys())
+    return set()
 
 
 def parse_resolution_buckets(resolution_buckets_str: str) -> list[tuple[int, int, int]]:
@@ -1172,18 +1751,37 @@ def compute_scaled_resolution_buckets(
     return scaled_buckets
 
 
-_ALLOWED_HDR_TRANSFER = frozenset({"auto", "pq", "hlg", "srgb", "linear"})
-_ALLOWED_HDR_VAE_ENCODING = frozenset({"reinhard", "pu21", "logc3", "lf_log1p"})
+def _atomic_save(data: Any, out: Path) -> None:  # noqa: ANN401
+    """Save to ``out`` atomically via per-PID temp file + replace.
+    Crash mid-write leaves an orphan ``.tmp.<pid>`` file that the skip logic
+    ignores. The per-PID suffix makes concurrent writes from multiple ranks
+    collision-free.
+    """
+    tmp = out.with_suffix(f"{out.suffix}.tmp.{os.getpid()}")
+    torch.save(data, tmp)
+    tmp.replace(out)
 
 
-def _parse_latent_save_dtype(name: str) -> torch.dtype:
-    key = name.lower().strip()
-    mapping = {"float32": torch.float32, "bfloat16": torch.bfloat16, "float16": torch.float16}
-    if key not in mapping:
-        raise typer.BadParameter(
-            f"Unknown latent save dtype {name!r}; expected one of: {', '.join(sorted(mapping))}"
-        )
-    return mapping[key]
+def _build_sharded_dataloader(
+    dataset: Dataset,
+    *,
+    batch_size: int,
+    num_workers: int,
+    is_done: Callable[[int], bool],
+    overwrite: bool,
+) -> DataLoader | None:
+    """Return a DataLoader over this rank's interleaved shard of ``dataset``.
+    When ``overwrite`` is False, items whose outputs already exist (per
+    ``is_done``) are filtered out. Returns ``None`` if this rank has nothing
+    to do, so the caller can early-return without loading any models.
+    """
+    state = PartialState()
+    todo = [i for i in range(state.process_index, len(dataset), state.num_processes) if overwrite or not is_done(i)]
+    if not todo:
+        logger.info(f"Rank {state.process_index}/{state.num_processes}: nothing to do")
+        return None
+    logger.info(f"Rank {state.process_index}/{state.num_processes}: processing {len(todo):,} of {len(dataset):,} items")
+    return DataLoader(Subset(dataset, todo), batch_size=batch_size, shuffle=False, num_workers=num_workers)
 
 
 @app.command()
@@ -1232,6 +1830,11 @@ def main(  # noqa: PLR0913
         default=None,
         help="Output directory for audio latents (required if --with-audio is set)",
     ),
+    overwrite: bool = typer.Option(
+        default=False,
+        help="Re-encode every item even if its output exists. Use when rerunning with "
+        "changed parameters (different model, resolution, etc.) so stale outputs are replaced.",
+    ),
     hdr_ingest: bool = typer.Option(
         default=False,
         help="HDR decode to scene-linear float32; save hdr_latent in each .pt; tone-map for VAE input",
@@ -1240,23 +1843,21 @@ def main(  # noqa: PLR0913
         default="auto",
         help="Color transfer for HDR linearization: auto, pq, hlg, srgb, or linear",
     ),
-    latent_save_dtype: str = typer.Option(
-        default="float32",
-        help="Torch dtype for saved VAE latents on disk: float32, bfloat16, or float16",
-    ),
     hdr_synth_bracket_ev: str | None = typer.Option(
         default=None,
         help='Optional LatentHDR-style synthetic γ-LDR stack: "ev_min:ev_max:step" (e.g. "-7:5:1"); requires --hdr-ingest',
     ),
     hdr_vae_encoding: str = typer.Option(
         default="reinhard",
-        help="With --hdr-ingest: VAE pixel encoding: reinhard | pu21 | logc3 | lf_log1p (LF-Diff log tonemap μ=5000)",
+        help="With --hdr-ingest: VAE pixel encoding: reinhard | pu21 | logc3 | lf_log1p",
     ),
 ) -> None:
     """Process videos/images and save latent representations for video generation training.
     This script processes videos and images from metadata files and saves latent representations
     that can be used for training video generation models. The output latents will maintain
     the same folder structure and naming as the corresponding media files.
+    For multi-GPU preprocessing, invoke under ``accelerate launch`` -- each process
+    will handle an interleaved shard of the dataset.
     Examples:
         # Process videos from a CSV file
         python scripts/process_videos.py dataset.csv --resolution-buckets 768x768x25 \\
@@ -1281,18 +1882,13 @@ def main(  # noqa: PLR0913
     if with_audio and audio_output_dir is None:
         raise typer.BadParameter("--audio-output-dir is required when --with-audio is set")
 
-    # Parse resolution buckets
-    parsed_resolution_buckets = parse_resolution_buckets(resolution_buckets)
-
     ht = hdr_transfer.lower().strip()
     if ht not in _ALLOWED_HDR_TRANSFER:
         raise typer.BadParameter(
             f"Unknown hdr-transfer {hdr_transfer!r}; expected one of: {', '.join(sorted(_ALLOWED_HDR_TRANSFER))}"
         )
-
     if hdr_synth_bracket_ev and not hdr_ingest:
-        raise typer.BadParameter('--hdr-synth-bracket-ev requires --hdr-ingest')
-
+        raise typer.BadParameter("--hdr-synth-bracket-ev requires --hdr-ingest")
     hve = hdr_vae_encoding.lower().strip()
     if hve not in _ALLOWED_HDR_VAE_ENCODING:
         raise typer.BadParameter(
@@ -1300,9 +1896,10 @@ def main(  # noqa: PLR0913
             f"{', '.join(sorted(_ALLOWED_HDR_VAE_ENCODING))}"
         )
     if hve != "reinhard" and not hdr_ingest:
-        raise typer.BadParameter("--hdr-vae-encoding pu21, logc3, or lf_log1p requires --hdr-ingest")
+        raise typer.BadParameter("--hdr-vae-encoding other than reinhard requires --hdr-ingest")
 
-    latent_dtype = _parse_latent_save_dtype(latent_save_dtype)
+    # Parse resolution buckets
+    parsed_resolution_buckets = parse_resolution_buckets(resolution_buckets)
 
     if len(parsed_resolution_buckets) > 1:
         logger.warning(
@@ -1323,11 +1920,11 @@ def main(  # noqa: PLR0913
         vae_tiling=vae_tiling,
         with_audio=with_audio,
         audio_output_dir=audio_output_dir,
+        overwrite=overwrite,
         hdr_ingest=hdr_ingest,
         hdr_transfer=ht,
         hdr_synth_bracket_ev=hdr_synth_bracket_ev,
         hdr_vae_encoding=hve,
-        latent_save_dtype=latent_dtype,
     )
 
 

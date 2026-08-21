@@ -19,16 +19,6 @@ LTX-2 Pipelines provides production-ready implementations that abstract away the
 - 📦 **Self-Contained**: Handles model loading, encoding, decoding, and file I/O
 - 🚀 **CLI Support**: All pipelines can be run as command-line scripts
 
-### Kino: cinematic long takes
-
-This fork targets **long coherent takes**, **rich prompts** (Gemma long-context encoding; see `LTX_GEMMA_ENCODE_CAP` in [ltx-core](../ltx-core/README.md#text-encoding-gemma)), and **edit-style** assembly—not lowest-latency previews. Practical defaults:
-
-- **Quality**: Prefer **`TI2VidTwoStagesPipeline`** or **`TI2VidTwoStagesHQPipeline`** over one-stage or distilled-only runs when fidelity matters.
-- **Identity / anchors**: Use **`ConsistencyPipeline`** with hero images and optional keyframes; use **`RetakePipeline`** to fix a **time range** in an existing clip instead of re-rendering everything.
-- **Bridging**: **`KeyframeInterpolationPipeline`** between approved stills when helpful.
-
-Full narrative: **[docs/cinematic-long-form.md](../../docs/cinematic-long-form.md)**.
-
 ---
 
 ## 🚀 Quick Start
@@ -65,16 +55,17 @@ python -m ltx_pipelines.ti2vid_two_stages --help
 
 Available pipeline modules:
 
-- `ltx_pipelines.consistency` - Consistency-first wrapper for hero images, keyframes, reference clips, and masks.
 - `ltx_pipelines.ti2vid_two_stages` - Two-stage text/image-to-video (recommended).
 - `ltx_pipelines.ti2vid_two_stages_hq` - Two-stage text/image-to-video (different sampler, better quality).
 - `ltx_pipelines.ti2vid_one_stage` - Single-stage text/image-to-video.
+- `ltx_pipelines.t2a_one_stage` - Single-stage text-to-audio (audio-only output).
 - `ltx_pipelines.distilled` - Fast text/image-to-video pipeline using only the distilled model.
 - `ltx_pipelines.ic_lora` - Video-to-video with IC-LoRA.
 - `ltx_pipelines.keyframe_interpolation` - Keyframe interpolation.
 - `ltx_pipelines.a2vid_two_stage` - Audio-to-video generation conditioned on an input audio.
 - `ltx_pipelines.retake` - Regenerate a time region of an existing video.
 - `ltx_pipelines.hdr_ic_lora` - Video-to-video with HDR output (linear float via LogC3 inverse decode).
+- `ltx_pipelines.lipdub` - Lip dubbing / re-voicing with IC-LoRA and audio reference conditioning.
 
 Use `--help` with any pipeline module to see all available options and parameters.
 
@@ -84,12 +75,7 @@ Use `--help` with any pipeline module to see all available options and parameter
 
 ### Quick Decision Tree
 
-For **maximum cinematic quality** on long or hero shots, prefer **two-stage** pipelines (**`TI2VidTwoStagesPipeline`** / **`TI2VidTwoStagesHQPipeline`**) and read **[docs/cinematic-long-form.md](../../docs/cinematic-long-form.md)**. The tree below is the general routing chart.
-
 ```text
-Do you need stronger subject identity consistency from references?
-├─ YES → Use ConsistencyPipeline
-│
 Do you have an existing video to modify?
 ├─ YES → Use RetakePipeline (regenerate a specific time region)
 │
@@ -108,7 +94,7 @@ Do you need to condition on existing images/videos?
 │
 └─ NO → Text-to-video only
    ├─ Do you need best quality?
-   │  └─ YES → Use TI2VidTwoStagesPipeline (default production) or TI2VidTwoStagesHQPipeline (res_2s, often fewer steps)
+   │  └─ YES → Use TI2VidTwoStagesPipeline (recommended for production)
    │
    └─ Do you need fastest inference?
       └─ YES → Use DistilledPipeline (with 8 predefined sigmas)
@@ -120,7 +106,6 @@ Do you need to condition on existing images/videos?
 
 | Pipeline | Stages | [Multimodal Guidance](#%EF%B8%8F-multimodal-guidance) | Upsampling | Conditioning | Best For |
 | -------- | ------ | --- | ---------- | ------------- | -------- |
-| **ConsistencyPipeline** | 2 | ✅ | ✅ | Hero image + keyframes + optional reference video/mask | Identity retention and reference consistency |
 | **TI2VidTwoStagesPipeline** | 2 | ✅ | ✅ | Image | **Production quality** (recommended) |
 | **TI2VidTwoStagesHQPipeline** | 2 | ✅ | ✅ | Image | Same as above, res_2s sampler (higher quality) |
 | **TI2VidOneStagePipeline** | 1 | ✅ | ❌ | Image | Educational, prototyping |
@@ -130,53 +115,11 @@ Do you need to condition on existing images/videos?
 | **A2VidPipelineTwoStage** | 2 | ✅ | ✅ | Audio + Image | Audio-driven video generation |
 | **RetakePipeline** | 1 | ✅ | ❌ | Source Video | Regenerating a time region of a video |
 | **HDRICLoraPipeline** | 2 | ❌ | ✅ | Video | HDR video-to-video (linear float output for EXR) |
+| **LipDubPipeline** | 2 | ✅ | ✅ | Video + Audio | Lip dubbing with audio ref conditioning |
 
 ---
 
 ## 📦 Available Pipelines
-
-### ConsistencyPipeline
-
-**Best for:** Keeping a subject or hero asset stable across a shot while still allowing motion, scene changes, and optional reference-video guidance.
-
-**Source**: [`src/ltx_pipelines/consistency.py`](src/ltx_pipelines/consistency.py)
-
-This wrapper adds a consistency-first workflow on top of the existing TI2Vid and IC-LoRA pipelines. It accepts a **hero image**, optional extra **keyframes**, an optional **reference video**, and an optional **reference mask**. When only still references are provided it dispatches to [`TI2VidTwoStagesPipeline`](src/ltx_pipelines/ti2vid_two_stages.py); when a reference video is provided it dispatches to [`ICLoraPipeline`](src/ltx_pipelines/ic_lora.py). Consistency presets automatically expand the hero image into periodic identity anchors and tune the default conditioning strengths.
-
-**Use when:** You want SeeDance-style identity retention, need a simpler reference workflow than manually combining `--image`, `--video-conditioning`, and conditioning-mask flags, or want one entrypoint for still-reference and reference-video consistency work.
-
-**Example:**
-
-```bash
-python -m ltx_pipelines.consistency \
-    --checkpoint-path path/to/ltx.safetensors \
-    --distilled-lora path/to/distilled_lora.safetensors 0.8 \
-    --spatial-upsampler-path path/to/upsampler.safetensors \
-    --gemma-root path/to/gemma \
-    --prompt "A fashion model turns toward camera under neon lighting." \
-    --hero-image path/to/hero.png \
-    --keyframe path/to/turn_profile.png 48 \
-    --consistency-preset strong_identity \
-    --output-path output.mp4
-```
-
-**Reference clip example:**
-
-```bash
-python -m ltx_pipelines.consistency \
-    --distilled-checkpoint-path path/to/ltx_distilled.safetensors \
-    --ic-lora path/to/ic_lora.safetensors 0.8 \
-    --spatial-upsampler-path path/to/upsampler.safetensors \
-    --gemma-root path/to/gemma \
-    --prompt "The same presenter walks across a studio set and points at a floating display." \
-    --hero-image path/to/hero.png \
-    --reference-video path/to/reference_motion.mp4 \
-    --reference-mask path/to/subject_mask.mp4 \
-    --consistency-preset masked_subject \
-    --output-path output.mp4
-```
-
----
 
 ### 1. TI2VidTwoStagesPipeline
 
@@ -298,6 +241,34 @@ Two-stage video-to-video on the distilled model with an HDR IC-LoRA. Decoded lat
 
 ---
 
+### 10. LipDubPipeline
+
+**Best for:** Lip dubbing, rephrasing while keeping the same speaker identity and matching lip movements to new audio.
+
+**Source**: [`src/ltx_pipelines/lipdub.py`](src/ltx_pipelines/lipdub.py)
+
+Uses IC-LoRA on a **distilled** checkpoint with a **single** lip-dub IC-LoRA applied in **both** stages. The reference clip provides video and audio reference tokens whose VAE latents are appended to the target audio sequence as frozen reference tokens. The frame count and frame rate are derived from the reference video (frame count is silently snapped to the nearest `8k+1`), so the CLI does not accept `--num-frames` or `--frame-rate`. Required: `--reference-video`. Optional: `--reference-strength`. LoRA: [`Lightricks/LTX-2.3-22b-IC-LoRA-LipDub`](https://huggingface.co/Lightricks/LTX-2.3-22b-IC-LoRA-LipDub).
+
+**Note:** Requires a distilled model checkpoint and one lip-dub IC-LoRA (`--lora` exactly once).
+
+**Use when:** Dubbing, rephrasing with matched lips and speaker identity.
+
+---
+
+### 11. T2AOneStagePipeline
+
+**Best for:** Text-to-audio — generating speech/audio only (no video) from a text prompt, e.g. driving an audio-style LoRA such as an accent LoRA.
+
+**Source**: [`src/ltx_pipelines/t2a_one_stage.py`](src/ltx_pipelines/t2a_one_stage.py)
+
+Single-stage, **audio-only** generation: the video branch is absent (`video=None`), so only the audio modality is denoised and decoded through the audio VAE + vocoder, producing a wave file. Audio duration is derived from `--num-frames` / `--frame-rate` (the same `8k+1` frame convention as video). Audio guidance (CFG/STG) is optional — the `--audio-*` flags default to the model's values; the video→audio cross-modal guidance is disabled since there is no video modality.
+
+**Extra CLI arguments (all optional, with sensible defaults):** `--num-frames`, `--frame-rate`, `--negative-prompt`, `--audio-cfg-guidance-scale`, `--audio-stg-guidance-scale`, `--audio-stg-blocks`, `--audio-rescale-scale`, `--audio-skip-step`. No `--height/--width/--image` (audio has no spatial dimensions).
+
+**Use when:** You need speech/audio from text alone, or to evaluate an audio-only LoRA (accent, voice style) without generating video.
+
+---
+
 ## 🎨 Conditioning Types
 
 Pipelines use different conditioning methods from [`ltx-core`](../ltx-core/) for controlling generation. See the [ltx-core conditioning documentation](../ltx-core/README.md#conditioning--control) for details.
@@ -350,8 +321,6 @@ The multimodal guider combines three guidance signals during each denoising step
 2. **STG (Perturbation Guidance)**: Improves structural coherence by perturbing specific transformer blocks and steering away from the perturbed prediction.
 3. **Modality CFG**: For joint audio-video generation, steers the model away from unsynced video and audio results.
 
-**Implementation (memory):** [`_guided_denoise`](src/ltx_pipelines/utils/denoisers.py) runs **one transformer forward per active pass** (conditional, unconditional, STG perturbation, modality isolation) at the latent batch size, then combines outputs in the guiders. That caps activation memory compared to batching every pass into a single forward. STG and modality isolation still add extra passes versus CFG-only, so they trade speed for quality.
-
 ### Example Configuration
 
 ```python
@@ -387,8 +356,6 @@ audio_guider_params = MultiModalGuiderParams(
 
 ### Memory Optimization
 
-**Guided denoising:** With multimodal guidance enabled, peak VRAM is dominated by the largest single forward in [`denoisers.py`](src/ltx_pipelines/utils/denoisers.py) (not the number of passes multiplied into one batch). For tight VRAM, prefer `stg_scale=0.0` / `modality_scale=1.0` / `cfg_scale` near **1.0** on the modality you can relax, and combine with FP8 or weight offloading below.
-
 **FP8 Quantization (Lower Memory Footprint):**
 
 For smaller GPU memory footprint, use the `--quantization` flag and set `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`.
@@ -417,7 +384,9 @@ PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True python -m ltx_pipelines.ti2vid_
 When authoring custom scripts, pass a `QuantizationPolicy` to pipeline classes:
 
 ```python
-from ltx_core.quantization import QuantizationPolicy
+from ltx_core.quantization.fp8_cast import build_policy as build_fp8_cast_policy
+# Alternative:
+# from ltx_core.quantization.fp8_scaled_mm import build_policy as build_fp8_scaled_mm_policy
 
 pipeline = TI2VidTwoStagesPipeline(
     checkpoint_path=ltx_model_path,
@@ -425,7 +394,7 @@ pipeline = TI2VidTwoStagesPipeline(
     spatial_upsampler_path=upsampler_path,
     gemma_root=gemma_root_path,
     loras=[],
-    quantization=QuantizationPolicy.fp8_cast(),  # or QuantizationPolicy.fp8_scaled_mm()
+    quantization=build_fp8_cast_policy(ltx_model_path),
 )
 pipeline(...)
 ```
@@ -446,6 +415,69 @@ By default, pipelines clean GPU memory (especially transformer weights) between 
 # utils.cleanup_memory()  # Comment out if you have enough VRAM
 ```
 
+### Compilation (`torch.compile`)
+
+Compiling the transformer blocks with `torch.compile` speeds up inference. It is **opt-in and off by default**. The blocks are compiled shape-polymorphically (the sequence dimension is marked dynamic), so one compiled artifact serves any token count without recompiling.
+
+**CLI** — the `--compile` flag maps directly to `CompilationConfig`:
+
+| Form | Result |
+| ---- | ------ |
+| *(flag absent)* | eager, no compilation |
+| `--compile` | compile with defaults |
+| `--compile KEY=VALUE ...` | compile, overriding individual fields |
+
+```bash
+# Defaults
+python -m ltx_pipelines.ti2vid_two_stages --compile --checkpoint-path=...
+
+# reduce-overhead captures CUDA graphs -- the main latency lever for the denoising loop.
+# Off by default because graph capture reserves static memory pools (extra VRAM), so it
+# trades memory for speed; enable it when you have headroom.
+python -m ltx_pipelines.ti2vid_two_stages --compile mode=reduce-overhead --checkpoint-path=...
+
+# Several overrides at once
+python -m ltx_pipelines.ti2vid_two_stages \
+    --compile mode=max-autotune fullgraph=true dynamic=true --checkpoint-path=...
+```
+
+| Field | Values | Default | Notes |
+| ----- | ------ | ------- | ----- |
+| `mode` | `none`, `reduce-overhead`, `max-autotune`, … | `none` | `reduce-overhead`/`max-autotune` enable CUDA graphs |
+| `backend` | `inductor`, `eager`, … | `inductor` | |
+| `fullgraph` | `true`/`false` | `false` | |
+| `dynamic` | `auto`/`true`/`false` | `auto` | the seq dim is marked dynamic regardless |
+| `inductor_config` | JSON object or path to a `.json` | `{}` | `torch._inductor.config` overrides |
+| `dynamo_config` | JSON object or path to a `.json` | `{"inline_inbuilt_nn_modules": true, "cache_size_limit": 256}` | `torch._dynamo.config` overrides |
+
+**Controlling inductor / dynamo configs.** `inductor_config` and `dynamo_config` take either an inline JSON object or a path to a `.json` file, applied via `torch._inductor.config.patch(...)` / `torch._dynamo.config.patch(...)` around the compiled forward. They **replace the defaults wholesale — they do not merge**, so when overriding `dynamo_config` re-include any defaults you want to keep:
+
+```bash
+python -m ltx_pipelines.ti2vid_two_stages \
+    --compile 'inductor_config={"max_autotune": true}' \
+              'dynamo_config={"inline_inbuilt_nn_modules": true, "cache_size_limit": 256, "recompile_limit": 32}' \
+    --checkpoint-path=...
+```
+
+**Programmatically**, pass a `CompilationConfig` to the pipeline:
+
+```python
+from ltx_core.model.transformer.compiling import CompilationConfig
+
+pipeline = TI2VidTwoStagesPipeline(
+    ...,
+    compilation_config=CompilationConfig(mode="reduce-overhead"),
+)
+```
+
+**Faster cache loads: `unsafe_skip_cache_dynamic_shape_guards` (unsafe, opt-in).** Inductor's FX-graph cache re-checks the dynamic-shape guards stored with each entry on every lookup. Setting this flag skips that re-check (every entry is treated as a guard hit), which speeds up warm and cross-process cache loads. It is **not enabled by default** because it is a correctness hazard: a kernel first compiled at a small sequence length keeps int32 address arithmetic, and reusing it at a larger sequence length (roughly **>58k tokens/rank**) overflows int32 and reads out of bounds — surfacing as a CUDA illegal memory access or silently corrupted output. Only enable it when your token counts stay within the range the cached kernels were compiled for:
+
+```bash
+python -m ltx_pipelines.ti2vid_two_stages \
+    --compile 'inductor_config={"unsafe_skip_cache_dynamic_shape_guards": true}' \
+    --checkpoint-path=...
+```
+
 ### Denoising Loop Optimization
 
 **Gradient Estimation Denoising Loop:**
@@ -462,12 +494,13 @@ def denoising_loop(sigmas, video_state, audio_state, stepper):
         video_state=video_state,
         audio_state=audio_state,
         stepper=stepper,
-        denoise_fn=your_denoise_function,
+        transformer=transformer,
+        denoiser=denoiser,
         ge_gamma=2.0,  # Gradient estimation coefficient
     )
 ```
 
-This allows you to use **20-30 steps instead of 40** while maintaining quality. The implementation lives in [`samplers.py`](src/ltx_pipelines/utils/samplers.py) and is re-exported from [`ltx_pipelines.utils`](src/ltx_pipelines/utils/__init__.py).
+This allows you to use **20-30 steps instead of 40** while maintaining quality. The gradient estimation function is defined in [`samplers.py`](src/ltx_pipelines/utils/samplers.py).
 
 ---
 
@@ -483,15 +516,18 @@ This allows you to use **20-30 steps instead of 40** while maintaining quality. 
 ## 📖 Example: Image-to-Video
 
 ```python
-from ltx_core.loader import LTXV_LORA_COMFY_RENAMING_MAP, LoraPathStrengthAndSDOps
-from ltx_pipelines.ti2vid_two_stages import TI2VidTwoStagesPipeline
 from ltx_core.components.guiders import MultiModalGuiderParams
+from ltx_core.loader import LTXV_LORA_COMFY_RENAMING_MAP, LoraPathStrengthAndSDOps
+from ltx_core.model.video_vae import TilingConfig, get_video_chunks_number
+from ltx_pipelines.ti2vid_two_stages import TI2VidTwoStagesPipeline
+from ltx_pipelines.utils.args import ImageConditioningInput
+from ltx_pipelines.utils.media_io import encode_video
 
 distilled_lora = [
     LoraPathStrengthAndSDOps(
         "/path/to/distilled_lora.safetensors",
         0.6,
-        LTXV_LORA_COMFY_RENAMING_MAP
+        LTXV_LORA_COMFY_RENAMING_MAP,
     ),
 ]
 
@@ -521,19 +557,31 @@ audio_guider_params = MultiModalGuiderParams(
     stg_blocks=[29],
 )
 
-# Generate video from image
-pipeline(
+# Generate video from image. The pipeline returns (video_iterator, audio);
+# the caller is responsible for encoding to file via encode_video().
+num_frames = 121
+frame_rate = 25.0
+tiling_config = TilingConfig.default()
+video, audio = pipeline(
     prompt="A serene landscape with mountains in the background",
-    output_path="output.mp4",
+    negative_prompt="worst quality, low quality, blurry, distorted",
     seed=42,
     height=512,
     width=768,
-    num_frames=121,
-    frame_rate=25.0,
+    num_frames=num_frames,
+    frame_rate=frame_rate,
     num_inference_steps=40,
     video_guider_params=video_guider_params,
     audio_guider_params=audio_guider_params,
-    images=[ImageConditioningInput("input_image.jpg", 0, 1.0, 33)],  # Image at frame 0, strength 1.0, CRF 33
+    images=[ImageConditioningInput("input_image.jpg", 0, 1.0, 33)],  # path, frame_idx=0, strength=1.0, crf=33
+    tiling_config=tiling_config,
+)
+encode_video(
+    video=video,
+    fps=frame_rate,
+    audio=audio,
+    output_path="output.mp4",
+    video_chunks_number=get_video_chunks_number(num_frames, tiling_config),
 )
 ```
 

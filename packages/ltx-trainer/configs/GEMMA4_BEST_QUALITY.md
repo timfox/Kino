@@ -15,7 +15,10 @@ Use **bridge rank 512** (highest practical low-rank bottleneck before the useles
 | 5 | **Fold** → native LTX | `fold_flat_dim_bridge.py --flat-dim-bridge-rank 512` |
 | 6 | Probe native (exit **0**) | same probe on folded checkpoint |
 | 7 | Re-preprocess **native** | same `dataset.json`, **native** `model_path`, **no** bridge rank; `rm -rf conditions/` first |
-| 8 | **Phase 2** — native LoRA 128 | `ltx2_av_lora_gemma4_31b_native_best.yaml` |
+| 8 | **Phase 2** — native LoRA 128 | `ltx2_av_lora_gemma4_31b_native_best.yaml` (`GOPEX_RESEARCH_PROFILE=quality_max`, `./scripts/kino-research-profile.sh patch-configs`) |
+| 8b | **Evolve connectors** | `ltx2_av_lora_gemma4_31b_native_connectors_evolve.yaml` (same `quality_max` av_fold gates) |
+| 8b | **(optional)** AV fold sidecars + quality-weighted loss | `GOPEX_ENABLE_AV_FOLD=1` prep; `GOPEX_AV_FOLD_TRAIN=1` phase2 — [LTX_FOLD_HOOKS.md](../../../../documents/LTX_FOLD_HOOKS.md) |
+| 8c | **Quality orchestrator** | `./scripts/kino-train-quality.sh train` or `./scripts/kino-unified-quality.sh full` |
 
 **Gopex 31B one-shot script:** `../../../scripts/kino-gemma4-native-path.sh` (plan → phase1a → fold → native-preprocess → phase2).
 
@@ -69,12 +72,27 @@ Stop **vLLM** and other GPU jobs before training steps.
 
 ## Inference (after training)
 
+**Native path (recommended):**
+
+```bash
+source ../../../scripts/gopex-gemma-env.sh
+./scripts/kino-gemma4-native-path.sh delivery
+# or: ./scripts/kino-native-delivery-sample.sh
+```
+
+Uses folded `NATIVE_LTX`, Phase 2 LoRA, **native** `merged_native/conditions/*.pt` (41 frames, CFG aligned with training). Do **not** use phase0 `text_embeds_*` sidecars or `--flat-dim-bridge-rank` on native checkpoints.
+
+**Low-level:**
+
 ```bash
 python scripts/inference.py \
   --checkpoint /path/to/ltx-2.3-22b-gemma4-native.safetensors \
   --text-encoder-path /path/to/gemma-4-snapshot \
   --lora-path …/lora_weights_step_XXXXX.safetensors \
+  --conditions-path …/merged_native/conditions/….pt \
+  --num-inference-steps 40 --guidance-scale 4.0 \
+  --height 576 --width 1024 --num-frames 41 --skip-audio \
   --prompt "…" --output out.mp4
 ```
 
-Use `--flat-dim-bridge-rank 512` only if still on non-native checkpoint + interim weights.
+Use `--flat-dim-bridge-rank 512` only for **interim** (pre-fold) bridge512 Phase 2.

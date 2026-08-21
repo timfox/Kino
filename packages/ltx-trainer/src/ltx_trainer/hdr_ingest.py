@@ -137,12 +137,12 @@ def linear_scene_to_logc3_display(scene_linear_fchw: Tensor) -> Tensor:
     """LumiVid-style **LogC3** codes in ``[0, 1]`` for frozen SDR VAE input (arXiv:2604.11788, Sec. 3.1).
 
     Maps non-negative scene-linear RGB with ARRI LogC3 (EI 800 constants in ``ltx_core.hdr.LogC3``).
-    Unlike X2HDR PU21 here, **no per-clip peak rescale** is applied: LogC3 already spans many orders
-    of magnitude in linear light; rescaling would distort relative radiance vs the standard curve.
-    Very bright linear values can **saturate** to LogC3 code 1.0; inverse decompress then cannot recover
-    the original peak (same as ``ltx_core.hdr.LogC3`` semantics).
+    When ``HDR_HIGHLIGHT_KNEE=1`` (default), a soft shoulder is applied first so blown skin/specular
+    highlights do not all saturate to code 1.0. Optional ``HDR_SCENE_PEAK_PERCENTILE`` (e.g. ``0.995``)
+    rescales by a high percentile instead of the absolute max.
     """
-    return _LOGC3.compress(scene_linear_fchw.clamp(min=0.0))
+    prepared = prepare_scene_linear_for_vae(scene_linear_fchw)
+    return _LOGC3.compress(prepared)
 
 
 def lumivid_meta_block(*, vae_encoding: str = "logc3") -> dict[str, Any]:
@@ -183,7 +183,8 @@ def linear_scene_to_lf_diff_tonemap_display(
     mu: float = LF_DIFF_TONEMAP_MU_DEFAULT,
 ) -> Tensor:
     """Apply LF-Diff ``T`` channel-wise to scene-linear frames for frozen VAE input (same shape)."""
-    return lf_diff_tonemap_display(scene_linear_fchw, mu=mu)
+    prepared = prepare_scene_linear_for_vae(scene_linear_fchw)
+    return lf_diff_tonemap_display(prepared, mu=mu)
 
 
 def lf_diff_tonemap_l1(hdr: Tensor, hdr_hat: Tensor, *, mu: float = LF_DIFF_TONEMAP_MU_DEFAULT) -> Tensor:
@@ -515,6 +516,74 @@ def reinhard_tonemap(linear_rgb: Tensor) -> Tensor:
     return x / (1.0 + x)
 
 
+def _env_flag(name: str, default: str = "0") -> bool:
+    import os
+
+    return os.environ.get(name, default).strip().lower() in ("1", "true", "yes", "on")
+
+
+def soft_knee_compress_linear(
+    scene_linear: Tensor,
+    *,
+    threshold: float = 0.72,
+    softness: float = 0.22,
+) -> Tensor:
+    """Roll off scene-linear highlights before LogC3 / VAE encode (reduces shoulder clipping).
+
+    Values below ``threshold`` are unchanged. Above ``threshold``, a smooth exponential shoulder
+    asymptotes toward 1.0 so specular skin and lamps do not all pile into LogC3 code 1.0.
+    """
+    x = scene_linear.clamp(min=0.0)
+    t = float(threshold)
+    s = max(float(softness), 1e-6)
+    excess = (x - t).clamp(min=0.0)
+    compressed = t + (1.0 - t) * (1.0 - torch.exp(-excess / s))
+    return torch.where(x > t, compressed, x)
+
+
+def normalize_scene_linear_by_percentile(
+    scene_linear: Tensor,
+    percentile: float = 0.995,
+    *,
+    max_samples: int = 1_048_576,
+) -> Tensor:
+    """Scale scene-linear RGB so the given percentile maps to 1.0 (ignores a few fireflies)."""
+    flat = scene_linear.reshape(-1)
+    n = int(flat.numel())
+    if n == 0:
+        return scene_linear
+    if n > max_samples:
+        step = max(1, n // max_samples)
+        flat = flat[::step][:max_samples]
+    peak = torch.quantile(flat.float(), float(percentile)).clamp(min=1e-8)
+    return scene_linear / peak
+
+
+def prepare_scene_linear_for_vae(
+    scene_linear_fchw: Tensor,
+    *,
+    highlight_knee: bool | None = None,
+    knee_threshold: float | None = None,
+    knee_softness: float | None = None,
+    peak_percentile: float | None = None,
+) -> Tensor:
+    """Optional highlight protection before HDR VAE encodings (env: ``HDR_HIGHLIGHT_KNEE``)."""
+    import os
+
+    if highlight_knee is None:
+        highlight_knee = _env_flag("HDR_HIGHLIGHT_KNEE", "1")
+    if not highlight_knee:
+        return scene_linear_fchw.clamp(min=0.0)
+    kt = float(knee_threshold if knee_threshold is not None else os.environ.get("HDR_KNEE_THRESHOLD", "0.72"))
+    ks = float(knee_softness if knee_softness is not None else os.environ.get("HDR_KNEE_SOFTNESS", "0.22"))
+    x = soft_knee_compress_linear(scene_linear_fchw, threshold=kt, softness=ks)
+    if peak_percentile is None and os.environ.get("HDR_SCENE_PEAK_PERCENTILE", "").strip():
+        peak_percentile = float(os.environ["HDR_SCENE_PEAK_PERCENTILE"])
+    if peak_percentile is not None and peak_percentile > 0.0:
+        x = normalize_scene_linear_by_percentile(x, peak_percentile)
+    return x
+
+
 HDR_META_PACK_BYTES = 2048
 
 
@@ -588,7 +657,15 @@ def synthetic_gamma_ldr_stack_from_linear_hdr(
     if normalize == "max":
         peak = flat.max().clamp(min=1e-8)
     elif normalize == "p999":
-        peak = torch.quantile(flat, 0.999).clamp(min=1e-8)
+        # torch.quantile rejects very large 1-D inputs; stride-subsample for a stable p999.
+        max_q = 1_000_000
+        n = int(flat.numel())
+        if n > max_q:
+            step = max(1, n // max_q)
+            sample = flat[::step][:max_q]
+        else:
+            sample = flat
+        peak = torch.quantile(sample.float(), 0.999).clamp(min=1e-8)
     else:
         raise ValueError(f"Unknown normalize mode {normalize!r}")
     x_hdr = x / peak
@@ -645,6 +722,44 @@ def merge_log_domain_radiance(
     return torch.exp(log_r / den).to(dtype=ldrs_display.dtype)
 
 
+def sdr2hdr_meta_block(
+    *,
+    mevm_evs: tuple[float, ...] = (-4.0, 0.0, 4.0),
+) -> dict[str, Any]:
+    """Metadata for Tedla et al. SDR2HDR bracket+merge (arXiv:2605.14703)."""
+    return {
+        "sdr2hdr": {
+            "arxiv_id": "2605.14703",
+            "mevm_evs": list(mevm_evs),
+            "vmm_features": "linear_sdr,radiance,ev_per_pixel",
+            "note": "MEVM finetune optional; photometric proxy + trainable VMM in ltx_trainer.sdr2hdr",
+        }
+    }
+
+
+def lucky_hdr_meta_block(
+    *,
+    ev_min: float = -2.0,
+    ev_max: float = 2.0,
+    num_frames: int = 5,
+    checkpoint: str | None = None,
+) -> dict[str, Any]:
+    """Metadata for Li et al. LuckyHDR bracket align-and-merge (arXiv:2604.19976)."""
+    block: dict[str, Any] = {
+        "lucky_hdr": {
+            "arxiv_id": "2604.19976",
+            "ev_min": ev_min,
+            "ev_max": ev_max,
+            "num_frames": num_frames,
+            "merge": "iterative_convex_shift_merge",
+            "note": "Trainable stack in ltx_trainer.lucky_hdr; merge via lucky_hdr_merge.py",
+        }
+    }
+    if checkpoint:
+        block["lucky_hdr"]["checkpoint"] = checkpoint
+    return block
+
+
 def latenthdr_meta_block(
     *,
     ev_recipe: tuple[float, float, float] = (-7.0, 5.0, 1.0),
@@ -661,5 +776,30 @@ def latenthdr_meta_block(
             "synthetic_bracket_recipe": {"ev_min": ev_min, "ev_max": ev_max, "ev_step": ev_step, "gamma": 2.2},
             "save_ldr_ev_stack": save_ldr_stack,
             "ev_spec_saved": ev_spec_saved,
+        }
+    }
+
+
+def diffhdr_meta_block(*, vae_encoding: str = "log_gamma") -> dict[str, Any]:
+    """DiffHDR log-gamma VAE provenance (Yu et al. arXiv:2604.06161)."""
+    return {
+        "diffhdr": {
+            "arxiv_id": "2604.06161",
+            "vae_input_encoding": vae_encoding,
+            "log_gamma_m": 16.0,
+            "note": "Context-focused attention + flow matching in ltx_trainer.diffhdr",
+        }
+    }
+
+
+def vdp_hdr_meta_block(*, num_frames: int = 5, gamma: float = 2.2) -> dict[str, Any]:
+    """VDP-HDR bracket + fusion provenance (arXiv:2605.11628)."""
+    return {
+        "vdp_hdr": {
+            "arxiv_id": "2605.11628",
+            "bracket_frames": num_frames,
+            "gamma": gamma,
+            "fusion": "channel_concat_unet",
+            "note": "Stage-1 LTX bracket LoRA + Fusion UNet in ltx_trainer.vdp_hdr",
         }
     }

@@ -19,6 +19,7 @@ _REQUIRED_SRC = (
     "src/ltx_trainer/trainer.py",
     "src/ltx_trainer/config.py",
     "src/ltx_trainer/validation_sampler.py",
+    "src/ltx_trainer/validation_runner.py",
     "src/ltx_trainer/datasets.py",
     "src/ltx_trainer/model_loader.py",
 )

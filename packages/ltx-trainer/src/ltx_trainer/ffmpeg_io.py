@@ -517,6 +517,69 @@ def write_rgb_video(
         raise FFmpegError("ffmpeg encode failed", cmd=cmd, stderr=proc.stderr.decode(errors="replace"))
 
 
+def write_rgb_float32_exr_sequence(
+    frames_fhwc: np.ndarray,
+    output_pattern: str | Path,
+    *,
+    fps: float = 24.0,
+    loglevel: str | None = None,
+) -> None:
+    """Write ``[F,H,W,3]`` float32 RGB frames to OpenEXR sequence via ffmpeg.
+
+    Notes:
+    - Uses rawvideo stdin to avoid huge temporary uint8 buffers.
+    - Uses ``gbrpf32le`` (planar) which is widely supported for EXR.
+    """
+    if frames_fhwc.ndim != 4 or frames_fhwc.shape[-1] != 3:
+        raise ValueError(f"Expected frames [F,H,W,3], got {frames_fhwc.shape}")
+    if frames_fhwc.dtype != np.float32:
+        frames_fhwc = frames_fhwc.astype(np.float32, copy=False)
+    out = Path(output_pattern)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    f, h, w, _c = frames_fhwc.shape
+    ff, _ = require_ffmpeg()
+    cmd = [
+        ff,
+        "-hide_banner",
+        "-loglevel",
+        (loglevel or os.environ.get("LTX_FFMPEG_LOGLEVEL", "error")),
+        "-y",
+        "-f",
+        "rawvideo",
+        "-pix_fmt",
+        "gbrpf32le",
+        "-s",
+        f"{w}x{h}",
+        "-r",
+        str(fps),
+        "-i",
+        "-",
+        "-an",
+        "-f",
+        "image2",
+        str(out),
+    ]
+    proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    assert proc.stdin is not None
+    try:
+        for t in range(int(f)):
+            frame = frames_fhwc[t]  # [H,W,3] RGB
+            # Convert to planar G,B,R as expected by gbrp*
+            g = np.ascontiguousarray(frame[..., 1])
+            b = np.ascontiguousarray(frame[..., 2])
+            r = np.ascontiguousarray(frame[..., 0])
+            proc.stdin.write(g.tobytes())
+            proc.stdin.write(b.tobytes())
+            proc.stdin.write(r.tobytes())
+        proc.stdin.close()
+        _out, err = proc.communicate()
+    finally:
+        if proc.stdin and not proc.stdin.closed:
+            proc.stdin.close()
+    if proc.returncode != 0:
+        raise FFmpegError("ffmpeg exr sequence failed", cmd=cmd, stderr=(err or b"").decode(errors="replace"))
+
+
 def concat_videos(paths: Sequence[Path], output: Path, *, reencode: bool = True) -> None:
     """Concat demuxer; re-encode by default for heterogeneous inputs."""
     if not paths:

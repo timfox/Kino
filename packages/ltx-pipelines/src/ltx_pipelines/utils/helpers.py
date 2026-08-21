@@ -1,55 +1,125 @@
 import gc
 import logging
-from dataclasses import replace
+import os
 
 import torch
 
-from ltx_core.components.guiders import MultiModalGuider, MultiModalGuiderFactory
 from ltx_core.components.noisers import Noiser
-from ltx_core.components.protocols import DiffusionStepProtocol, GuiderProtocol
 from ltx_core.conditioning import (
     ConditioningItem,
     VideoConditionByKeyframeIndex,
     VideoConditionByLatentIndex,
 )
-from ltx_core.guidance.perturbations import (
-    BatchedPerturbationConfig,
-    Perturbation,
-    PerturbationConfig,
-    PerturbationType,
-)
-from ltx_core.model.audio_vae import encode_audio
-from ltx_core.model.transformer import Modality, X0Model
+from ltx_core.model.audio_vae import AudioProcessor, encode_audio_tensor_for_inference
+from ltx_core.model.transformer import Modality
 from ltx_core.model.video_vae import TilingConfig, VideoEncoder
 from ltx_core.text_encoders.gemma import GemmaTextEncoder
-from ltx_core.text_encoders.gemma.embeddings_processor import EmbeddingsProcessorOutput
-from ltx_core.tools import AudioLatentTools, LatentTools, VideoLatentTools
+from ltx_core.tools import LatentTools
 from ltx_core.types import AudioLatentShape, LatentState, VideoLatentShape, VideoPixelShape
 from ltx_pipelines.utils.args import ImageConditioningInput
-from ltx_pipelines.utils.constants import DEFAULT_IMAGE_CRF
 from ltx_pipelines.utils.media_io import (
     decode_audio_from_file,
     decode_image,
-    decode_video_by_frame,
     decode_video_from_file,
     get_videostream_fps,
-    load_image_conditioning,
+    load_image_and_preprocess,
     resize_aspect_ratio_preserving,
     video_preprocess,
 )
-from ltx_pipelines.utils.types import (
-    DenoisingFunc,
-    DenoisingLoopFunc,
-    PipelineComponents,
-)
-
-logger = logging.getLogger(__name__)
 
 
 def get_device() -> torch.device:
     if torch.cuda.is_available():
         return torch.device("cuda", torch.cuda.current_device())
     return torch.device("cpu")
+
+
+def parse_torch_cuda_index(spec: str | None) -> int | None:
+    """Parse ``GOPEX_LTX_DEVICE`` / ``CUDA_DEVICE`` style string → CUDA index, or ``None`` if unset."""
+    raw = (spec or "").strip()
+    if not raw:
+        return None
+    if raw.isdigit():
+        return int(raw)
+    if raw.lower().startswith("cuda:"):
+        tail = raw.split(":", 1)[1].strip()
+        return int(tail) if tail.isdigit() else None
+    return None
+
+
+def resolve_ltx_compute_device(explicit: torch.device | None = None) -> torch.device:
+    """Torch device for diffusion, upsampler, image/audio blocks, and the embeddings processor.
+
+    Gemma may run elsewhere via :func:`resolve_prompt_gemma_device`. Video VAE decode may differ via
+    :func:`resolve_video_decode_device`.
+    """
+    if explicit is not None:
+        return explicit
+    idx = parse_torch_cuda_index(os.environ.get("GOPEX_LTX_DEVICE") or os.environ.get("CUDA_DEVICE"))
+    if idx is not None and torch.cuda.is_available():
+        if idx < 0 or idx >= torch.cuda.device_count():
+            logging.warning("GOPEX_LTX_DEVICE index %s out of range; using current_device.", idx)
+            return get_device()
+        return torch.device("cuda", idx)
+    return get_device()
+
+
+def resolve_video_decode_device(main_device: torch.device, raw: str | None) -> torch.device:
+    """Where the **video VAE decoder** runs: same GPU as *main_device*, another CUDA device, or CPU.
+
+    *raw* is typically from ``GOPEX_LTX_VIDEO_DECODE_DEVICE`` or a project field: ``\"\"`` (same as main),
+    ``\"cpu\"``, ``\"cuda:1\"``, or ``\"1\"``.
+    """
+    s = (raw or "").strip()
+    if not s:
+        return main_device
+    low = s.lower()
+    if low in ("cpu", "host", "c"):
+        return torch.device("cpu")
+    if low.startswith("cuda:"):
+        return torch.device(s)
+    if s.isdigit() and torch.cuda.is_available():
+        i = int(s)
+        if 0 <= i < torch.cuda.device_count():
+            return torch.device("cuda", i)
+        logging.warning("Video decode CUDA index %s invalid; using main device %s.", s, main_device)
+        return main_device
+    if low in ("same", "main", "ltx", "auto"):
+        return main_device
+    logging.warning("Unrecognized video decode device %r; using main device %s.", s, main_device)
+    return main_device
+
+
+def resolve_prompt_gemma_device(main_device: torch.device, spec: str | None) -> torch.device:
+    """CUDA/CPU device for **Gemma** inside :class:`~ltx_pipelines.utils.blocks.PromptEncoder`.
+
+    When *spec* is empty, ``GOPEX_LTX_GEMMA_DEVICE`` is consulted; if still empty, returns *main_device*
+    (legacy single-GPU: Gemma and LTX share one card).
+
+    Accepts the same strings as :func:`resolve_video_decode_device` (``cpu``, ``cuda:0``, ``1``, …).
+    After Gemma runs, hidden states are moved to *main_device* for the checkpoint embeddings processor.
+    """
+    raw = (spec or "").strip() or (os.environ.get("GOPEX_LTX_GEMMA_DEVICE") or "").strip()
+    return resolve_video_decode_device(main_device, raw)
+
+
+def run_video_decode(
+    video_decoder,
+    latent: torch.Tensor,
+    tiling_config,
+    generator: torch.Generator,
+    *,
+    seed: int,
+    dtype: torch.dtype,
+    main_device: torch.device,
+    decode_device: torch.device,
+):
+    """Decode *latent* with *video_decoder* (built for *decode_device*), moving tensors when devices differ."""
+    if decode_device == main_device:
+        return video_decoder(latent, tiling_config, generator)
+    latent_d = latent.detach().to(device=decode_device, dtype=dtype)
+    gen_d = torch.Generator(device=decode_device).manual_seed(seed)
+    return video_decoder(latent_d, tiling_config, gen_d)
 
 
 def cleanup_memory() -> None:
@@ -63,45 +133,98 @@ def cleanup_memory() -> None:
         logging.warning("Host empty cache cleanup failed; ignoring.", exc_info=True)
 
 
-def encode_prompts(
-    prompts: list[str],
-    model_ledger: object,
-    *,
-    enhance_prompt_image: str | None = None,
-    enhance_prompt_seed: int = 42,
-    enhance_first_prompt: bool = False,
-) -> list[EmbeddingsProcessorOutput]:
-    """Encode prompts through Gemma → embeddings processor, freeing each after use.
-    Loads the text encoder from *model_ledger*, optionally enhances the first
-    prompt, encodes all *prompts*, frees the text encoder, then loads the
-    embeddings processor to produce the final outputs.  Because the text encoder
-    is loaded and freed entirely within this function, there are no lingering
-    references that could prevent GPU memory reclamation.
-    Args:
-        prompts: Text prompts to encode.
-        model_ledger: ModelLedger instance (used to load text encoder and embeddings processor).
-        enhance_prompt_image: Optional image path for prompt enhancement.
-        enhance_prompt_seed: Seed for prompt enhancement (default 42).
-        enhance_first_prompt: If True, enhance ``prompts[0]`` before encoding.
-    Returns:
-        List of EmbeddingsProcessorOutput, one per prompt.
-    """
-    text_encoder = model_ledger.text_encoder()
-    if enhance_first_prompt:
-        prompts = list(prompts)
-        prompts[0] = generate_enhanced_prompt(text_encoder, prompts[0], enhance_prompt_image, seed=enhance_prompt_seed)
-    raw_outputs = [text_encoder.encode(p) for p in prompts]
-    torch.cuda.synchronize()
-    del text_encoder
-    cleanup_memory()
+def _conform_latent_length(latent: torch.Tensor, expected_frames_count: int) -> torch.Tensor:
+    actual_frames = latent.shape[2]
+    if actual_frames > expected_frames_count:
+        latent = latent[:, :, :expected_frames_count]
+    elif actual_frames < expected_frames_count:
+        shape_as_list = list(latent.shape)
+        shape_as_list[2] = expected_frames_count - actual_frames
+        pad = torch.zeros(
+            shape_as_list,
+            device=latent.device,
+            dtype=latent.dtype,
+        )
+        latent = torch.cat([latent, pad], dim=2)
+    return latent
 
-    embeddings_processor = model_ledger.gemma_embeddings_processor()
-    results: list[EmbeddingsProcessorOutput] = [
-        embeddings_processor.process_hidden_states(hs, mask) for hs, mask in raw_outputs
-    ]
-    del embeddings_processor
-    cleanup_memory()
-    return results
+
+def video_latent_from_file(
+    video_encoder: VideoEncoder,
+    file_path: str,
+    output_shape: VideoPixelShape,
+    device: torch.device,
+    dtype: torch.dtype,
+    start_time: float = 0.0,
+    max_duration: float | None = None,
+    tiling_config: TilingConfig | None = None,
+) -> torch.Tensor | None:
+    """Load video from a file, and construct the video latent conforming to video output shape.
+    Args:
+        video_encoder: Model used to encode pixel frames to latent space.
+        file_path: Path to the video file.
+        output_shape: Target pixel shape (height, width, frames, fps) for the conditioning.
+        device: Device to run the encoder and hold tensors on.
+        dtype: Dtype for the output latents.
+        start_time: Start time in seconds to begin reading the video (default 0.0).
+        max_duration: Maximum duration in seconds. If None, uses output_shape.frames at
+            output_shape.fps (default None).
+        tiling_config: Tiling configuration for the encoder. Defaults to TilingConfig.default().
+    Returns:
+        Encoded video latents of shape (1, C, T, H, W) with T = required_latent_frames, or
+        None (currently this function always returns a tensor).
+    """
+    fps = get_videostream_fps(file_path)
+    if fps != output_shape.fps:
+        raise ValueError(f"Input video FPS {fps} does not match output FPS {output_shape.fps}, not supported")
+    max_duration = max_duration or output_shape.frames / fps
+    frame_gen = decode_video_from_file(path=file_path, device=device, start_time=start_time, max_duration=max_duration)
+    frames = video_preprocess(frame_gen, output_shape.height, output_shape.width, dtype, device)
+    latents = video_encoder.tiled_encode(frames, tiling_config or TilingConfig.default())
+    required_latent_frames = VideoLatentShape.from_pixel_shape(output_shape).frames
+    return _conform_latent_length(latents, required_latent_frames)
+
+
+def audio_latent_from_file(
+    audio_encoder: torch.nn.Module,
+    file_path: str,
+    output_shape: VideoPixelShape,
+    device: torch.device,
+    dtype: torch.dtype,
+    start_time: float = 0.0,
+    max_duration: float | None = None,
+) -> torch.Tensor | None:
+    """Load audio from a file, and construct the audio latent conforming to video output shape.
+    Args:
+        audio_encoder: Model used to encode audio to latent space.
+        file_path: Path to the audio or video file containing an audio stream.
+        output_shape: Target video pixel shape; used to derive required latent frames
+            and, when max_duration is None, the audio duration (output_shape.frames / fps).
+        device: Device to run the encoder and hold tensors on.
+        dtype: Dtype for the output latents.
+        start_time: Start time in seconds to begin reading the audio (default 0.0).
+        max_duration: Maximum duration in seconds. If None, uses the full span implied
+            by output_shape (default None).
+    Returns:
+        Encoded audio latents of shape (1, C, T, ...) with T = required_latent_frames, or
+        None if the file has no audio stream.
+    """
+    max_duration = max_duration or output_shape.frames / output_shape.fps
+    audio_in = decode_audio_from_file(file_path, device, start_time, max_duration)
+    if audio_in is None:
+        return None
+    try:
+        processor = AudioProcessor(
+            target_sample_rate=audio_encoder.sample_rate,
+            mel_bins=audio_encoder.mel_bins,
+            mel_hop_length=audio_encoder.mel_hop_length,
+            n_fft=audio_encoder.n_fft,
+        ).to(device=device)
+    except Exception:
+        processor = None
+    return encode_audio_tensor_for_inference(
+        audio_in, audio_encoder, processor, output_shape
+    ).to(device, dtype)
 
 
 def combined_image_conditionings(
@@ -116,7 +239,7 @@ def combined_image_conditionings(
     and using other encoded images as the keyframe conditionings."""
     conditionings = []
     for img in images:
-        image = load_image_conditioning(
+        image = load_image_and_preprocess(
             image_path=img.path,
             height=height,
             width=width,
@@ -151,7 +274,7 @@ def image_conditionings_by_replacing_latent(
 ) -> list[ConditioningItem]:
     conditionings = []
     for img in images:
-        image = load_image_conditioning(
+        image = load_image_and_preprocess(
             image_path=img.path,
             height=height,
             width=width,
@@ -181,7 +304,7 @@ def image_conditionings_by_adding_guiding_latent(
 ) -> list[ConditioningItem]:
     conditionings = []
     for img in images:
-        image = load_image_conditioning(
+        image = load_image_and_preprocess(
             image_path=img.path,
             height=height,
             width=width,
@@ -194,72 +317,6 @@ def image_conditionings_by_adding_guiding_latent(
             VideoConditionByKeyframeIndex(keyframes=encoded_image, frame_idx=img.frame_idx, strength=img.strength)
         )
     return conditionings
-
-
-def noise_video_state(
-    output_shape: VideoPixelShape,
-    noiser: Noiser,
-    conditionings: list[ConditioningItem],
-    components: PipelineComponents,
-    dtype: torch.dtype,
-    device: torch.device,
-    noise_scale: float = 1.0,
-    initial_latent: torch.Tensor | None = None,
-) -> tuple[LatentState, VideoLatentTools]:
-    """Initialize and noise a video latent state for the diffusion pipeline.
-    Creates a video latent state from the output shape, applies conditionings,
-    and adds noise using the provided noiser. Returns the noised state and
-    video latent tools for further processing. If initial_latent is provided, it will be used to create the initial
-    state, otherwise an empty initial state will be created.
-    """
-    video_latent_shape = VideoLatentShape.from_pixel_shape(
-        shape=output_shape,
-        latent_channels=components.video_latent_channels,
-        scale_factors=components.video_scale_factors,
-    )
-    video_tools = VideoLatentTools(components.video_patchifier, video_latent_shape, output_shape.fps)
-    video_state = create_noised_state(
-        tools=video_tools,
-        conditionings=conditionings,
-        noiser=noiser,
-        dtype=dtype,
-        device=device,
-        noise_scale=noise_scale,
-        initial_latent=initial_latent,
-    )
-
-    return video_state, video_tools
-
-
-def noise_audio_state(
-    output_shape: VideoPixelShape,
-    noiser: Noiser,
-    conditionings: list[ConditioningItem],
-    components: PipelineComponents,
-    dtype: torch.dtype,
-    device: torch.device,
-    noise_scale: float = 1.0,
-    initial_latent: torch.Tensor | None = None,
-) -> tuple[LatentState, AudioLatentTools]:
-    """Initialize and noise an audio latent state for the diffusion pipeline.
-    Creates an audio latent state from the output shape, applies conditionings,
-    and adds noise using the provided noiser. Returns the noised state and
-    audio latent tools for further processing. If initial_latent is provided, it will be used to create the initial
-    state, otherwise an empty initial state will be created.
-    """
-    audio_latent_shape = AudioLatentShape.from_video_pixel_shape(output_shape)
-    audio_tools = AudioLatentTools(components.audio_patchifier, audio_latent_shape)
-    audio_state = create_noised_state(
-        tools=audio_tools,
-        conditionings=conditionings,
-        noiser=noiser,
-        dtype=dtype,
-        device=device,
-        noise_scale=noise_scale,
-        initial_latent=initial_latent,
-    )
-
-    return audio_state, audio_tools
 
 
 def create_noised_state(
@@ -312,11 +369,14 @@ def modality_from_latent_state(
     """
     return Modality(
         enabled=enabled,
-        latent=state.latent,
+        # Samplers may keep their arithmetic in fp32, while native LTX 2.x
+        # transformer weights are bf16. Normalize at the model boundary so
+        # resident and streaming/offload modes behave identically.
+        latent=state.latent.to(device=context.device, dtype=torch.bfloat16),
         sigma=sigma,
         timesteps=timesteps_from_mask(state.denoise_mask, sigma),
         positions=state.positions,
-        context=context,
+        context=context.to(device=context.device, dtype=torch.bfloat16),
         context_mask=None,
         attention_mask=state.attention_mask,
     )
@@ -326,299 +386,12 @@ def timesteps_from_mask(denoise_mask: torch.Tensor, sigma: float | torch.Tensor)
     """Compute timesteps from a denoise mask and sigma value.
     Multiplies the denoise mask by sigma to produce timesteps for each position
     in the latent state. Areas where the mask is 0 will have zero timesteps.
+    When sigma is ``(B,)`` it is reshaped to ``(B, 1, ...)`` so the batch
+    dimension aligns correctly with ``denoise_mask``.
     """
+    if isinstance(sigma, torch.Tensor) and sigma.dim() == 1:
+        sigma = sigma.view(-1, *([1] * (denoise_mask.dim() - 1)))
     return denoise_mask * sigma
-
-
-def simple_denoising_func(
-    video_context: torch.Tensor, audio_context: torch.Tensor, transformer: X0Model
-) -> DenoisingFunc:
-    def simple_denoising_step(
-        video_state: LatentState, audio_state: LatentState, sigmas: torch.Tensor, step_index: int
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        sigma = sigmas[step_index]
-        pos_video = modality_from_latent_state(video_state, video_context, sigma)
-        pos_audio = modality_from_latent_state(audio_state, audio_context, sigma)
-
-        denoised_video, denoised_audio = transformer(video=pos_video, audio=pos_audio, perturbations=None)
-        return denoised_video, denoised_audio
-
-    return simple_denoising_step
-
-
-def guider_denoising_func(
-    guider: GuiderProtocol,
-    v_context_p: torch.Tensor,
-    v_context_n: torch.Tensor,
-    a_context_p: torch.Tensor,
-    a_context_n: torch.Tensor,
-    transformer: X0Model,
-) -> DenoisingFunc:
-    def guider_denoising_step(
-        video_state: LatentState, audio_state: LatentState, sigmas: torch.Tensor, step_index: int
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        sigma = sigmas[step_index]
-        pos_video = modality_from_latent_state(video_state, v_context_p, sigma)
-        pos_audio = modality_from_latent_state(audio_state, a_context_p, sigma)
-
-        denoised_video, denoised_audio = transformer(video=pos_video, audio=pos_audio, perturbations=None)
-        if guider.enabled():
-            neg_video = modality_from_latent_state(video_state, v_context_n, sigma)
-            neg_audio = modality_from_latent_state(audio_state, a_context_n, sigma)
-
-            neg_denoised_video, neg_denoised_audio = transformer(video=neg_video, audio=neg_audio, perturbations=None)
-
-            denoised_video = denoised_video + guider.delta(denoised_video, neg_denoised_video)
-            denoised_audio = denoised_audio + guider.delta(denoised_audio, neg_denoised_audio)
-
-        return denoised_video, denoised_audio
-
-    return guider_denoising_step
-
-
-def multi_modal_guider_denoising_func(
-    video_guider: MultiModalGuider,
-    audio_guider: MultiModalGuider,
-    v_context: torch.Tensor,
-    a_context: torch.Tensor,
-    transformer: X0Model,
-    *,
-    last_denoised_video: torch.Tensor | None = None,
-    last_denoised_audio: torch.Tensor | None = None,
-) -> DenoisingFunc:
-    def guider_denoising_step(
-        video_state: LatentState, audio_state: LatentState, sigmas: torch.Tensor, step_index: int
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        nonlocal last_denoised_video, last_denoised_audio
-
-        if video_guider.should_skip_step(step_index) and audio_guider.should_skip_step(step_index):
-            return last_denoised_video, last_denoised_audio
-
-        sigma = sigmas[step_index]
-        pos_video_modality = modality_from_latent_state(
-            video_state, v_context, sigma, enabled=not video_guider.should_skip_step(step_index)
-        )
-        pos_audio_modality = modality_from_latent_state(
-            audio_state, a_context, sigma, enabled=not audio_guider.should_skip_step(step_index)
-        )
-
-        denoised_video, denoised_audio = transformer(
-            video=pos_video_modality, audio=pos_audio_modality, perturbations=None
-        )
-        neg_denoised_video, neg_denoised_audio = 0.0, 0.0
-        if video_guider.do_unconditional_generation() or audio_guider.do_unconditional_generation():
-            if video_guider.do_unconditional_generation() and video_guider.negative_context is None:
-                raise ValueError("Negative context is required for unconditioned denoising")
-            if audio_guider.do_unconditional_generation() and audio_guider.negative_context is None:
-                raise ValueError("Negative context is required for unconditioned denoising")
-            neg_video_modality = modality_from_latent_state(
-                video_state,
-                video_guider.negative_context
-                if video_guider.negative_context is not None
-                else pos_video_modality.context,
-                sigma,
-            )
-            neg_audio_modality = modality_from_latent_state(
-                audio_state,
-                audio_guider.negative_context
-                if audio_guider.negative_context is not None
-                else pos_audio_modality.context,
-                sigma,
-            )
-
-            neg_denoised_video, neg_denoised_audio = transformer(
-                video=neg_video_modality, audio=neg_audio_modality, perturbations=None
-            )
-
-        ptb_denoised_video, ptb_denoised_audio = 0.0, 0.0
-        if video_guider.do_perturbed_generation() or audio_guider.do_perturbed_generation():
-            perturbations = []
-            if video_guider.do_perturbed_generation():
-                perturbations.append(
-                    Perturbation(type=PerturbationType.SKIP_VIDEO_SELF_ATTN, blocks=video_guider.params.stg_blocks)
-                )
-            if audio_guider.do_perturbed_generation():
-                perturbations.append(
-                    Perturbation(type=PerturbationType.SKIP_AUDIO_SELF_ATTN, blocks=audio_guider.params.stg_blocks)
-                )
-            perturbation_config = PerturbationConfig(perturbations=perturbations)
-            ptb_denoised_video, ptb_denoised_audio = transformer(
-                video=pos_video_modality,
-                audio=pos_audio_modality,
-                perturbations=BatchedPerturbationConfig(perturbations=[perturbation_config]),
-            )
-
-        mod_denoised_video, mod_denoised_audio = 0.0, 0.0
-        if video_guider.do_isolated_modality_generation() or audio_guider.do_isolated_modality_generation():
-            perturbations = [
-                Perturbation(type=PerturbationType.SKIP_A2V_CROSS_ATTN, blocks=None),
-                Perturbation(type=PerturbationType.SKIP_V2A_CROSS_ATTN, blocks=None),
-            ]
-            perturbation_config = PerturbationConfig(perturbations=perturbations)
-            mod_denoised_video, mod_denoised_audio = transformer(
-                video=pos_video_modality,
-                audio=pos_audio_modality,
-                perturbations=BatchedPerturbationConfig(perturbations=[perturbation_config]),
-            )
-
-        if video_guider.should_skip_step(step_index):
-            denoised_video = last_denoised_video
-        else:
-            denoised_video = video_guider.calculate(
-                denoised_video, neg_denoised_video, ptb_denoised_video, mod_denoised_video
-            )
-
-        if audio_guider.should_skip_step(step_index):
-            denoised_audio = last_denoised_audio
-        else:
-            denoised_audio = audio_guider.calculate(
-                denoised_audio, neg_denoised_audio, ptb_denoised_audio, mod_denoised_audio
-            )
-
-        last_denoised_video = denoised_video
-        last_denoised_audio = denoised_audio
-
-        return denoised_video, denoised_audio
-
-    return guider_denoising_step
-
-
-def multi_modal_guider_factory_denoising_func(
-    video_guider_factory: MultiModalGuiderFactory,
-    audio_guider_factory: MultiModalGuiderFactory | None,
-    v_context: torch.Tensor,
-    a_context: torch.Tensor,
-    transformer: X0Model,
-) -> DenoisingFunc:
-    """Resolve guiders per step via factory.build_from_sigma, then multi_modal_guider_denoising_func."""
-    last_denoised_video: torch.Tensor | None = None
-    last_denoised_audio: torch.Tensor | None = None
-    sigma_vals_cached: list[float] | None = None
-
-    def guider_denoising_step(
-        video_state: LatentState, audio_state: LatentState, sigmas: torch.Tensor, step_index: int
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        nonlocal last_denoised_video, last_denoised_audio, sigma_vals_cached
-        if sigma_vals_cached is None:
-            sigma_vals_cached = sigmas.detach().cpu().tolist()
-        sigma_val = sigma_vals_cached[step_index]
-        video_guider = video_guider_factory.build_from_sigma(sigma_val)
-        audio_guider = (audio_guider_factory or video_guider_factory).build_from_sigma(sigma_val)
-        denoise_fn = multi_modal_guider_denoising_func(
-            video_guider,
-            audio_guider,
-            v_context,
-            a_context,
-            transformer,
-            last_denoised_video=last_denoised_video,
-            last_denoised_audio=last_denoised_audio,
-        )
-        denoised_video, denoised_audio = denoise_fn(video_state, audio_state, sigmas, step_index)
-        last_denoised_video, last_denoised_audio = denoised_video, denoised_audio
-        return denoised_video, denoised_audio
-
-    return guider_denoising_step
-
-
-def denoise_audio_video(  # noqa: PLR0913
-    output_shape: VideoPixelShape,
-    conditionings: list[ConditioningItem],
-    noiser: Noiser,
-    sigmas: torch.Tensor,
-    stepper: DiffusionStepProtocol,
-    denoising_loop_fn: DenoisingLoopFunc,
-    components: PipelineComponents,
-    dtype: torch.dtype,
-    device: torch.device,
-    noise_scale: float = 1.0,
-    initial_video_latent: torch.Tensor | None = None,
-    initial_audio_latent: torch.Tensor | None = None,
-) -> tuple[LatentState, LatentState]:
-    video_state, video_tools = noise_video_state(
-        output_shape=output_shape,
-        noiser=noiser,
-        conditionings=conditionings,
-        components=components,
-        dtype=dtype,
-        device=device,
-        noise_scale=noise_scale,
-        initial_latent=initial_video_latent,
-    )
-    audio_state, audio_tools = noise_audio_state(
-        output_shape=output_shape,
-        noiser=noiser,
-        conditionings=[],
-        components=components,
-        dtype=dtype,
-        device=device,
-        noise_scale=noise_scale,
-        initial_latent=initial_audio_latent,
-    )
-
-    video_state, audio_state = denoising_loop_fn(
-        sigmas,
-        video_state,
-        audio_state,
-        stepper,
-    )
-
-    video_state = video_tools.clear_conditioning(video_state)
-    video_state = video_tools.unpatchify(video_state)
-    audio_state = audio_tools.clear_conditioning(audio_state)
-    audio_state = audio_tools.unpatchify(audio_state)
-
-    return video_state, audio_state
-
-
-def denoise_video_only(  # noqa: PLR0913
-    output_shape: VideoPixelShape,
-    conditionings: list[ConditioningItem],
-    noiser: Noiser,
-    sigmas: torch.Tensor,
-    stepper: DiffusionStepProtocol,
-    denoising_loop_fn: DenoisingLoopFunc,
-    components: PipelineComponents,
-    dtype: torch.dtype,
-    device: torch.device,
-    noise_scale: float = 1.0,
-    initial_video_latent: torch.Tensor | None = None,
-    initial_audio_latent: torch.Tensor | None = None,
-) -> LatentState:
-    video_state, video_tools = noise_video_state(
-        output_shape=output_shape,
-        noiser=noiser,
-        conditionings=conditionings,
-        components=components,
-        dtype=dtype,
-        device=device,
-        noise_scale=noise_scale,
-        initial_latent=initial_video_latent,
-    )
-
-    audio_state, _ = noise_audio_state(
-        output_shape=output_shape,
-        noiser=noiser,
-        conditionings=[],
-        components=components,
-        dtype=dtype,
-        device=device,
-        noise_scale=0.0,
-        initial_latent=initial_audio_latent,
-    )
-
-    audio_state = replace(audio_state, denoise_mask=torch.zeros_like(audio_state.denoise_mask))
-
-    video_state, audio_state = denoising_loop_fn(
-        sigmas,
-        video_state,
-        audio_state,
-        stepper,
-    )
-
-    video_state = video_tools.clear_conditioning(video_state)
-    video_state = video_tools.unpatchify(video_state)
-
-    return video_state
 
 
 _UNICODE_REPLACEMENTS = str.maketrans("\u2018\u2019\u201c\u201d\u2014\u2013\u00a0\u2032\u2212", "''\"\"-- '-")
@@ -633,6 +406,16 @@ def clean_response(text: str) -> str:
         if char.isalpha():
             return text[i:]
     return text
+
+
+def build_reference_aware_prompt(prompt: str, reference_hint: str | None = None) -> str:
+    """Augment *prompt* with optional free-text reference context (Gemma preprocessing)."""
+    if not reference_hint:
+        return prompt
+    hint = reference_hint.strip()
+    if not hint:
+        return prompt
+    return f"{prompt.rstrip()}\n\n[Reference]\n{hint}"
 
 
 def generate_enhanced_prompt(
@@ -667,100 +450,3 @@ def assert_resolution(height: int, width: int, is_two_stage: bool) -> None:
             f"For {'two-stage' if is_two_stage else 'one-stage'} pipelines, "
             f"height and width must be multiples of {divisor}."
         )
-
-
-def build_reference_aware_prompt(prompt: str, reference_hint: str | None = None) -> str:
-    """Augment *prompt* with optional free-text reference context (used by Gemma preprocessing)."""
-    if not reference_hint:
-        return prompt
-    hint = reference_hint.strip()
-    if not hint:
-        return prompt
-    return f"{prompt.rstrip()}\n\n[Reference]\n{hint}"
-
-
-def _conform_latent_length(latent: torch.Tensor, expected_frames_count: int) -> torch.Tensor:
-    """Pad or trim the temporal dimension of a latent tensor to *expected_frames_count*."""
-    current = latent.shape[2]
-    if current == expected_frames_count:
-        return latent
-    if current > expected_frames_count:
-        return latent[:, :, :expected_frames_count, :, :]
-    pad_count = expected_frames_count - current
-    shape_as_list = list(latent.shape)
-    shape_as_list[2] = pad_count
-    pad = torch.zeros(shape_as_list, device=latent.device, dtype=latent.dtype)
-    return torch.cat([latent, pad], dim=2)
-
-
-def video_latent_from_file(
-    video_encoder: VideoEncoder,
-    file_path: str,
-    output_shape: VideoPixelShape,
-    device: torch.device,
-    dtype: torch.dtype,
-    start_time: float = 0.0,
-    max_duration: float | None = None,
-    tiling_config: TilingConfig | None = None,
-) -> torch.Tensor | None:
-    """Encode a video file into VAE latents matching *output_shape*."""
-    fps = get_videostream_fps(file_path)
-    if fps != output_shape.fps:
-        raise ValueError(f"Input video FPS {fps} does not match output FPS {output_shape.fps}, not supported")
-    max_duration = max_duration or output_shape.frames / fps
-    frame_gen = decode_video_from_file(
-        path=file_path, device=device, start_time=start_time, max_duration=max_duration
-    )
-    frames = video_preprocess(frame_gen, output_shape.height, output_shape.width, dtype, device)
-    latents = video_encoder.tiled_encode(frames, tiling_config or TilingConfig.default())
-    required_latent_frames = VideoLatentShape.from_pixel_shape(output_shape).frames
-    return _conform_latent_length(latents, required_latent_frames)
-
-
-def audio_latent_from_file(
-    audio_encoder: torch.nn.Module,
-    file_path: str,
-    output_shape: VideoPixelShape,
-    device: torch.device,
-    dtype: torch.dtype,
-    start_time: float = 0.0,
-    max_duration: float | None = None,
-) -> torch.Tensor | None:
-    """Encode audio from a file into latents aligned with *output_shape*."""
-    max_duration = max_duration or output_shape.frames / output_shape.fps
-    audio_in = decode_audio_from_file(file_path, device, start_time, max_duration)
-    if audio_in is None:
-        return None
-    latents = encode_audio(audio_in, audio_encoder, None).to(device, dtype)
-    required_latent_frames = AudioLatentShape.from_video_pixel_shape(output_shape).frames
-    return _conform_latent_length(latents, required_latent_frames)
-
-
-def offload_tensors_to_cpu_for_diffusion(*tensors: torch.Tensor | None) -> tuple[torch.Tensor | None, ...]:
-    """Detach and move diffusion context tensors to CPU to free VRAM between stages."""
-    out: list[torch.Tensor | None] = []
-    for t in tensors:
-        if t is None:
-            out.append(None)
-        else:
-            out.append(t.detach().cpu())
-    return tuple(out)
-
-
-def offload_image_conditioning_latents_to_cpu(conditionings: list[ConditioningItem]) -> None:
-    """Move conditioning latent tensors to CPU (in-place on mutable conditioning objects)."""
-    for c in conditionings:
-        if hasattr(c, "latent") and isinstance(c.latent, torch.Tensor):
-            c.latent = c.latent.detach().cpu()
-        if hasattr(c, "keyframes") and isinstance(c.keyframes, torch.Tensor):
-            c.keyframes = c.keyframes.detach().cpu()
-
-
-def load_mask_video(mask_path: str, height: int, width: int, num_frames: int) -> torch.Tensor:
-    """Load a grayscale conditioning mask as ``(1, 1, F, H, W)`` in ``[0, 1]``."""
-    device = get_device()
-    frame_gen = decode_video_by_frame(path=mask_path, frame_cap=num_frames, device=device)
-    mask_video = video_preprocess(frame_gen, height, width, torch.bfloat16, device)
-    mask = mask_video.mean(dim=1, keepdim=True)
-    mask = (mask + 1.0) / 2.0
-    return mask.clamp(0.0, 1.0)

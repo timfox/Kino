@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
+import os
 from pathlib import Path
 from typing import Any
 
@@ -58,6 +60,28 @@ def caption_key_for_tensor_path(file_rel_path: str | Path) -> str:
     return caption_keys_for_tensor_path(file_rel_path)[0]
 
 
+def lookup_caption(
+    caption_index: dict[str, str],
+    shard_path: str | Path,
+    *,
+    latents_root: str | Path | None = None,
+) -> str | None:
+    """Resolve a manifest caption for a latent shard path (backfill / audit helpers)."""
+    path = Path(shard_path)
+    candidates = caption_keys_for_tensor_path(path)
+    if latents_root is not None:
+        try:
+            rel = path.relative_to(Path(latents_root).resolve())
+            candidates = caption_keys_for_tensor_path(rel) + candidates
+        except ValueError:
+            pass
+    for key in candidates:
+        cap = caption_index.get(key)
+        if isinstance(cap, str) and cap.strip():
+            return cap.strip()
+    return None
+
+
 def feature_extractor_state_dict(fe: nn.Module, *, prefix: str = "feature_extractor.") -> dict[str, Tensor]:
     """Export trainable feature-extractor weights (bridge + aggregate linears)."""
     return {f"{prefix}{k}": v.detach() for k, v in fe.state_dict().items()}
@@ -75,6 +99,16 @@ def compose_low_rank_bridge_weights(
 ) -> Tensor:
     """``Linear(rank→out).weight @ Linear(in→rank).weight`` → dense ``[out, in]``."""
     return weight_out @ weight_in
+
+
+def apply_low_rank_bridge_to_aggregate(
+    aggregate_weight: Tensor,
+    weight_out: Tensor,
+    weight_in: Tensor,
+) -> Tensor:
+    """``aggregate @ weight_out @ weight_in`` without building the dense bridge (~250 GiB for rank-512)."""
+    agg = aggregate_weight.float()
+    return (agg @ weight_out.float()) @ weight_in.float()
 
 
 def fold_aggregate_with_bridge(
@@ -100,8 +134,12 @@ def fold_aggregate_with_bridge(
         layers = [m for m in bridge.children() if isinstance(m, nn.Linear)]
         if len(layers) != 2:
             raise ValueError("Expected Sequential flat_dim_bridge with two Linear layers")
-        b_full = compose_low_rank_bridge_weights(layers[1].weight, layers[0].weight)
-    elif isinstance(bridge, nn.Linear):
+        return apply_low_rank_bridge_to_aggregate(
+            aggregate_weight,
+            layers[1].weight,
+            layers[0].weight,
+        )
+    if isinstance(bridge, nn.Linear):
         b_full = bridge.weight
     else:
         raise TypeError(f"Unsupported bridge type: {type(bridge)}")
@@ -109,7 +147,7 @@ def fold_aggregate_with_bridge(
     if b_full.shape != (ckpt_flat, gemma_flat_in):
         raise ValueError(f"Bridge shape {tuple(b_full.shape)} expected ({ckpt_flat}, {gemma_flat_in})")
 
-    return aggregate_weight @ b_full
+    return aggregate_weight.float() @ b_full.float()
 
 
 def gemma_flat_dim_from_path(gemma_path: str | Path) -> int:
@@ -132,9 +170,54 @@ def gemma_flat_dim_from_path(gemma_path: str | Path) -> int:
 
 def ltx_checkpoint_flat_dim(model_path: str | Path) -> int:
     flat = peek_video_aggregate_embed_in_features(str(model_path))
-    if flat is None:
-        raise ValueError(f"Could not read video_aggregate_embed.in_features from {model_path}")
-    return int(flat)
+    if flat is not None:
+        return int(flat)
+    # LTX-2.5 split transformers ship without text aggregates; official flat is still 188160.
+    fallback = os.environ.get("GOPEX_LTX_OFFICIAL_FLAT_DIM", "").strip()
+    if fallback:
+        return int(fallback)
+    raise ValueError(
+        f"Could not read video_aggregate_embed.in_features from {model_path}. "
+        "For LTX-2.5 transformers without aggregates, set GOPEX_LTX_OFFICIAL_FLAT_DIM=188160 "
+        "and pass --inject-aggregates to fold_flat_dim_bridge.py."
+    )
+
+
+def gemma_caption_cache_enabled() -> bool:
+    """Default on for phase1a-style training (set GOPEX_GEMMA_CAPTION_CACHE=0 to disable)."""
+    return os.environ.get("GOPEX_GEMMA_CAPTION_CACHE", "1").strip().lower() not in ("0", "false", "no")
+
+
+def gemma_caption_cache_key(caption: str) -> str:
+    return hashlib.sha256(caption.strip().encode("utf-8")).hexdigest()[:32]
+
+
+def gemma_caption_cache_path(cache_dir: Path, caption: str) -> Path:
+    return cache_dir / f"{gemma_caption_cache_key(caption)}.pt"
+
+
+def load_gemma_caption_cache(cache_dir: Path, caption: str) -> tuple[tuple[Tensor, ...] | Tensor, Tensor] | None:
+    path = gemma_caption_cache_path(cache_dir, caption)
+    if not path.is_file():
+        return None
+    blob = torch.load(path, map_location="cpu", weights_only=True)
+    hs = blob["hidden_states"]
+    if isinstance(hs, list):
+        hs = tuple(hs)
+    return hs, blob["prompt_mask"]
+
+
+def save_gemma_caption_cache(
+    cache_dir: Path,
+    caption: str,
+    hidden_states: tuple[Tensor, ...] | Tensor,
+    prompt_mask: Tensor,
+) -> Path:
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    path = gemma_caption_cache_path(cache_dir, caption)
+    hs = list(hidden_states) if isinstance(hidden_states, tuple) else hidden_states
+    torch.save({"hidden_states": hs, "prompt_mask": prompt_mask.detach().cpu()}, path)
+    return path
 
 
 def fold_metadata_summary(

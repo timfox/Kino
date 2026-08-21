@@ -1,84 +1,87 @@
-"""Shared media suffix helpers (video, stills, Canon Raw 2)."""
+"""Shared media suffix lists and path helpers for dataset ingest and LTX preprocess."""
 
 from __future__ import annotations
 
 import os
 from pathlib import Path
 
-# Canon Raw version 2 (CR2) — still photos from Canon DSLRs.
-CANON_RAW_2_SUFFIXES: frozenset[str] = frozenset({".cr2"})
-
-# Related Canon raw stills (optional ingest; same decode path as CR2).
-CANON_RAW_SUFFIXES: frozenset[str] = frozenset({".cr2", ".cr3", ".crw"})
-
-COMMON_STILL_IMAGE_SUFFIXES: frozenset[str] = frozenset(
-    {".png", ".jpg", ".jpeg", ".webp", ".heic", ".heif", ".bmp", ".tif", ".tiff"}
-)
-
 VIDEO_SUFFIXES: frozenset[str] = frozenset(
-    {".mp4", ".mov", ".mkv", ".webm", ".m4v", ".avi", ".ogv", ".qt", ".mxf"}
+    {
+        ".mp4",
+        ".mov",
+        ".mkv",
+        ".webm",
+        ".m4v",
+        ".avi",
+        ".ogv",
+        ".qt",
+        ".mpg",
+        ".mpeg",
+        ".m2v",
+        ".m2ts",
+        ".mts",
+        ".insv",
+        ".lrv",
+        ".3gp",
+    }
 )
 
-# Insta360 proprietary containers (H.264/HEVC inside; decode via :mod:`ltx_trainer.insta360_ingest`).
+ALL_VIDEO_SUFFIXES = VIDEO_SUFFIXES
+
 INSTA360_VIDEO_SUFFIXES: frozenset[str] = frozenset({".insv", ".lrv"})
-INSTA360_STILL_SUFFIXES: frozenset[str] = frozenset({".insp"})
-INSTA360_SUFFIXES: frozenset[str] = INSTA360_VIDEO_SUFFIXES | INSTA360_STILL_SUFFIXES
+INSTA360_STILL_SUFFIXES: frozenset[str] = frozenset({".insp", ".dng"})
 
-STILL_IMAGE_SUFFIXES: frozenset[str] = COMMON_STILL_IMAGE_SUFFIXES | CANON_RAW_SUFFIXES | INSTA360_STILL_SUFFIXES
+CANON_RAW_2_SUFFIXES: frozenset[str] = frozenset({".cr2", ".cr3", ".crw"})
 
-# Union used by dataset discovery / split tools.
-ALL_VIDEO_SUFFIXES: frozenset[str] = VIDEO_SUFFIXES | INSTA360_VIDEO_SUFFIXES
-
-# QuickTime / MOV containers: decode via ffmpeg by default (ProRes, DNxHD, edit lists).
-FFMPEG_PREFERRED_VIDEO_SUFFIXES: frozenset[str] = frozenset({".mov", ".qt"})
+STILL_IMAGE_SUFFIXES: frozenset[str] = frozenset(
+    {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff", ".heic", ".heif"}
+)
 
 
-def path_suffix_lower(path: str | Path) -> str:
+def _suffix(path: str | Path) -> str:
     return Path(path).suffix.lower()
 
 
-def is_canon_raw2_path(path: str | Path) -> bool:
-    return path_suffix_lower(path) in CANON_RAW_2_SUFFIXES
-
-
-def is_canon_raw_path(path: str | Path) -> bool:
-    return path_suffix_lower(path) in CANON_RAW_SUFFIXES
-
-
 def is_still_image_path(path: str | Path) -> bool:
-    return path_suffix_lower(path) in STILL_IMAGE_SUFFIXES
+    s = _suffix(path)
+    return s in STILL_IMAGE_SUFFIXES or s in CANON_RAW_2_SUFFIXES or s in INSTA360_STILL_SUFFIXES
 
 
 def is_video_path(path: str | Path) -> bool:
-    return path_suffix_lower(path) in ALL_VIDEO_SUFFIXES
+    return _suffix(path) in ALL_VIDEO_SUFFIXES
 
 
 def is_insta360_video_path(path: str | Path) -> bool:
-    return path_suffix_lower(path) in INSTA360_VIDEO_SUFFIXES
+    return _suffix(path) in INSTA360_VIDEO_SUFFIXES
 
 
 def is_insta360_still_path(path: str | Path) -> bool:
-    return path_suffix_lower(path) in INSTA360_STILL_SUFFIXES
+    return _suffix(path) in INSTA360_STILL_SUFFIXES
 
 
 def is_insta360_path(path: str | Path) -> bool:
-    return path_suffix_lower(path) in INSTA360_SUFFIXES
+    return is_insta360_video_path(path) or is_insta360_still_path(path)
+
+
+def is_canon_raw2_path(path: str | Path) -> bool:
+    return _suffix(path) in CANON_RAW_2_SUFFIXES
+
+
+def is_canon_raw_path(path: str | Path) -> bool:
+    """Alias used by :mod:`ltx_trainer.utils` for Canon Raw decode."""
+    return is_canon_raw2_path(path)
 
 
 def prefer_ffmpeg_video_decode(path: str | Path) -> bool:
-    """True when ingest should use ffmpeg instead of PyAV (default for ``.mov`` / ``.qt``).
-
-    Override with ``LTX_MOV_DECODE=pyav`` to force PyAV for QuickTime, or ``LTX_VIDEO_BACKEND=ffmpeg``
-    for all containers.
-    """
-    suf = path_suffix_lower(path)
-    if suf in INSTA360_VIDEO_SUFFIXES:
+    """Whether to prefer ffmpeg over PyAV for this file (QuickTime / env override)."""
+    p = Path(path)
+    ext = p.suffix.lower()
+    if ext in INSTA360_VIDEO_SUFFIXES:
         return True
-    if suf not in FFMPEG_PREFERRED_VIDEO_SUFFIXES:
-        return False
-    mode = os.environ.get("LTX_MOV_DECODE", "ffmpeg").strip().lower()
-    if mode in ("pyav", "av"):
-        return False
-    if mode in ("ffmpeg", "ff", "1", "true", "yes"):
+    if ext in {".mov", ".qt", ".mpg", ".mpeg", ".m2v"}:
+        mode = os.environ.get("LTX_MOV_DECODE", "").strip().lower()
+        if mode == "pyav":
+            return False
         return True
-    return True  # default: ffmpeg for MOV
+    backend = os.environ.get("LTX_VIDEO_BACKEND", "pyav").strip().lower()
+    return backend == "ffmpeg"

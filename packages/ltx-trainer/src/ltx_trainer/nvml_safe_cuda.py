@@ -75,9 +75,27 @@ def nvml_healthy() -> bool:
         opt.step()
         return True
     except RuntimeError as exc:
-        if "nvmlInit" in str(exc) or "NVML_SUCCESS" in str(exc):
+        msg = str(exc)
+        if "nvmlInit" in msg or "NVML_SUCCESS" in msg:
+            return False
+        if "num_gpus" in msg or "DeferredCudaCallError" in type(exc).__name__:
             return False
         raise
+
+
+_WARMUP_PATCHED = False
+
+
+def disable_transformers_allocator_warmup() -> None:
+    """No-op Transformers ``caching_allocator_warmup`` (pre-allocates ~half model VRAM).
+
+    Safe on all hosts; required on ~24 GiB GPUs where 8-bit Gemma 31B load would OOM during warmup.
+    """
+    global _WARMUP_PATCHED
+    if _WARMUP_PATCHED:
+        return
+    _patch_transformers_caching_allocator_warmup()
+    _WARMUP_PATCHED = True
 
 
 def apply_nvml_safe_cuda_patches(*, force: bool = False) -> bool:
@@ -91,7 +109,7 @@ def apply_nvml_safe_cuda_patches(*, force: bool = False) -> bool:
         return False
 
     _set_cuda_malloc_async_allocator()
-    _patch_transformers_caching_allocator_warmup()
+    disable_transformers_allocator_warmup()
     _patch_torch_cuda_mem_get_info()
     _PATCHED = True
     logger.warning(
@@ -141,6 +159,30 @@ def _patch_torch_cuda_mem_get_info() -> None:
     cuda.mem_get_info = mem_get_info  # type: ignore[method-assign]
 
 
+def pin_training_cuda_device() -> int | None:
+    """Select physical GPU via ``GOPEX_TRAIN_CUDA_DEVICE`` without ``CUDA_VISIBLE_DEVICES`` remapping."""
+    raw = os.environ.get("GOPEX_TRAIN_CUDA_DEVICE", "").strip()
+    if not raw.isdigit():
+        return None
+    import torch
+
+    if not torch.cuda.is_available():
+        return None
+    idx = int(raw)
+    n = torch.cuda.device_count()
+    if idx < 0 or idx >= n:
+        import logging
+
+        logging.getLogger(__name__).warning(
+            "GOPEX_TRAIN_CUDA_DEVICE=%s ignored (cuda device count=%s)",
+            idx,
+            n,
+        )
+        return None
+    torch.cuda.set_device(idx)
+    return idx
+
+
 def resolve_gopex_cuda_device(env_key: str, fallback: str | int) -> str:
     """Parse ``GOPEX_*_CUDA_DEVICE`` (index or ``cuda:N``) for multi-GPU placement."""
     raw = os.environ.get(env_key, "").strip()
@@ -153,9 +195,16 @@ def resolve_gopex_cuda_device(env_key: str, fallback: str | int) -> str:
 
 def embeddings_processor_device(preferred: str) -> str:
     """Where to load LTX ``EmbeddingsProcessor`` during caption encode / validation cache."""
+    import torch
+
     if _nvml_safe_forced() or not nvidia_smi_ok():
         return "cpu"
-    return resolve_gopex_cuda_device("GOPEX_CONNECTOR_CUDA_DEVICE", preferred)
+    if torch.cuda.is_available():
+        fallback = preferred
+        if not os.environ.get("GOPEX_CONNECTOR_CUDA_DEVICE", "").strip():
+            fallback = resolve_gopex_cuda_device("GOPEX_PREPROCESS_CUDA_DEVICE", preferred)
+        return resolve_gopex_cuda_device("GOPEX_CONNECTOR_CUDA_DEVICE", fallback)
+    return preferred
 
 
 def move_gemma_encode_outputs_to_device(

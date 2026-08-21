@@ -21,14 +21,16 @@ def write_preprocess_meta(
 ) -> Path:
     """Write ``preprocess_meta.json`` under the precomputed root."""
     output_base = Path(output_base).expanduser().resolve()
+    resolved_model_path = Path(model_path).expanduser().resolve()
+    is_native = (resolved_model_path / "native_manifest.json").is_file()
     payload: dict[str, Any] = {
-        "model_path": str(Path(model_path).expanduser().resolve()),
+        "model_path": str(resolved_model_path),
         "text_encoder_path": str(Path(text_encoder_path).expanduser().resolve()),
         "flat_dim_bridge_rank": flat_dim_bridge_rank,
         "bridge_kind": (
             f"low_rank_{flat_dim_bridge_rank}"
             if flat_dim_bridge_rank is not None
-            else "dense_random"
+            else ("native" if is_native else "dense_random")
         ),
     }
     if dataset_file is not None:

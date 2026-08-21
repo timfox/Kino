@@ -33,6 +33,16 @@ export LORA_CKPT="${LORA_CKPT:-$(_resolve_lora_ckpt)}"
 export INFER_OUT="${WORK_ROOT}/samples/phase0_smoke.mp4"
 export HQ_OUT="${WORK_ROOT}/samples/hq_two_stage.mp4"
 export PROMPT="${PROMPT:-Archival black and white film, steady camera, clear motion, documentary style.}"
+# Smoke length: default matches training bucket (41 frames @ 24fps ≈ 1.7s). For ~20s: GOPEX_SMOKE_SECONDS=20
+export GOPEX_SMOKE_SECONDS="${GOPEX_SMOKE_SECONDS:-}"
+export GOPEX_SMOKE_NUM_FRAMES="${GOPEX_SMOKE_NUM_FRAMES:-41}"
+export GOPEX_SMOKE_FPS="${GOPEX_SMOKE_FPS:-24}"
+if [[ -n "$GOPEX_SMOKE_SECONDS" ]]; then
+  # LTX frame counts are typically 8n+1 (same family as 41 = 5*8+1).
+  GOPEX_SMOKE_NUM_FRAMES=$(( GOPEX_SMOKE_SECONDS * GOPEX_SMOKE_FPS ))
+  GOPEX_SMOKE_NUM_FRAMES=$(( (GOPEX_SMOKE_NUM_FRAMES / 8) * 8 + 1 ))
+fi
+export GOPEX_SMOKE_SKIP_AUDIO="${GOPEX_SMOKE_SKIP_AUDIO:-0}"
 
 cd "$GOPEX_REPO"
 echo "Gemma profile: ${GEMMA_PROFILE}  encoder=${GEMMA}  bridge_rank=${BRIDGE_RANK}  work_root=${WORK_ROOT}"
@@ -149,6 +159,9 @@ echo "=== 1) Smoke inference (LoRA + connector sidecar + bridge) ==="
 echo "Using LoRA: $LORA_CKPT"
 test -f "$LORA_CKPT" || { echo "Missing $LORA_CKPT — wait for training or export LORA_CKPT=/path/to/lora_weights_step_XXXXX.safetensors"; exit 1; }
 cd "$TRAINER"
+_smoke_audio_args=()
+[[ "${GOPEX_SMOKE_SKIP_AUDIO}" == "1" ]] && _smoke_audio_args=(--skip-audio)
+echo "Smoke: ${GOPEX_SMOKE_NUM_FRAMES} frames @ ${GOPEX_SMOKE_FPS} fps (~$(( (GOPEX_SMOKE_NUM_FRAMES - 1) / GOPEX_SMOKE_FPS ))s), audio=$([[ ${#_smoke_audio_args[@]} -eq 0 ]] && echo on || echo off)"
 python scripts/inference.py \
   --checkpoint "$LTX_CKPT" \
   --text-encoder-path "$GEMMA" \
@@ -156,8 +169,9 @@ python scripts/inference.py \
   --flat-dim-bridge-rank "$BRIDGE_RANK" \
   --prompt "$PROMPT" \
   --negative-prompt "worst quality, inconsistent motion, blurry, jittery, distorted" \
-  --height 576 --width 1024 --num-frames 41 --frame-rate 24 \
+  --height 576 --width 1024 --num-frames "$GOPEX_SMOKE_NUM_FRAMES" --frame-rate "$GOPEX_SMOKE_FPS" \
   --num-inference-steps 30 --guidance-scale 4.0 \
+  "${_smoke_audio_args[@]}" \
   --output "$INFER_OUT"
 
 if [[ "${RUN_YOUTUBE_MANIFEST:-0}" == "1" ]]; then

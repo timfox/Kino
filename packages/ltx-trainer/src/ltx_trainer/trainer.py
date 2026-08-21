@@ -24,9 +24,10 @@ from torch.optim.lr_scheduler import (
     LinearLR,
     LRScheduler,
     PolynomialLR,
+    SequentialLR,
     StepLR,
 )
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, WeightedRandomSampler
 from torchvision.transforms import functional as F  # noqa: N812
 
 from ltx_core.text_encoders.gemma import convert_to_additive_mask
@@ -49,7 +50,7 @@ from ltx_trainer.quantization import quantize_model
 from ltx_trainer.sigma_tracker import SigmaBucketTracker
 from ltx_trainer.timestep_samplers import SAMPLERS
 from ltx_trainer.training_state import ConfigFingerprint, RngStates, TrainingState
-from ltx_trainer.training_strategies import get_training_strategy
+from ltx_trainer.training_strategies import get_training_strategy, strategy_requires_audio
 from ltx_trainer.media_formats import is_still_image_path
 from ltx_trainer.utils import open_image_as_srgb, save_image
 from ltx_trainer.validation_sampler import CachedPromptEmbeddings, GenerationConfig, ValidationSampler
@@ -73,6 +74,29 @@ if not IS_MAIN_PROCESS:
 StepCallback = Callable[[int, int, list[Path]], None]  # (step, total, list[sampled_video_path]) -> None
 
 MEMORY_CHECK_INTERVAL = 200
+
+
+def _gemma_encode_cpu_requested() -> bool:
+    return os.environ.get("GOPEX_GEMMA_ENCODE_CPU", "").strip().lower() in ("1", "true", "yes")
+
+
+def _resolve_gemma_load_device(freeze_dit: bool, startup_device: str) -> str:
+    """Where to load Gemma for live caption training (second GPU preferred when frozen DiT)."""
+    from ltx_trainer.text_stack_utils import gemma_caption_cache_enabled
+
+    if _gemma_encode_cpu_requested():
+        return "cpu"
+    # 31B 8-bit often OOMs on 24GB cards; warm cache on CPU then unload (see GOPEX_GEMMA_UNLOAD_AFTER_CACHE).
+    if freeze_dit and gemma_caption_cache_enabled():
+        return "cpu"
+    if freeze_dit and torch.cuda.is_available():
+        train_raw = os.environ.get("GOPEX_TRAIN_CUDA_DEVICE", "0").strip() or "0"
+        gemma_raw = os.environ.get("GOPEX_GEMMA_CUDA_DEVICE", "").strip()
+        if gemma_raw:
+            return resolve_gopex_cuda_device("GOPEX_GEMMA_CUDA_DEVICE", "cuda:1")
+        if torch.cuda.device_count() > 1 and train_raw in ("0", ""):
+            return "cuda:1"
+    return startup_device
 
 
 def _text_embed_sidecar_path(main_weights_path: Path) -> Path:
@@ -108,13 +132,26 @@ def _text_connector_state_dict_for_save(embeddings_processor: EmbeddingsProcesso
 def _load_text_connector_sidecar(embeddings_processor: EmbeddingsProcessor, path: Path) -> None:
     sd = load_file(path)
     v_sd = {k[len("video_connector.") :]: v for k, v in sd.items() if k.startswith("video_connector.")}
-    embeddings_processor.video_connector.load_state_dict(v_sd, strict=True)
+    try:
+        embeddings_processor.video_connector.load_state_dict(v_sd, strict=True)
+    except RuntimeError as exc:
+        logger.warning(
+            "Video connector sidecar shape mismatch (%s) — leaving connectors at init weights",
+            exc,
+        )
+        return
     a_sd = {k[len("audio_connector.") :]: v for k, v in sd.items() if k.startswith("audio_connector.")}
     if a_sd:
         if embeddings_processor.audio_connector is None:
             logger.warning("Text-embed sidecar has audio_connector.* keys but no audio_connector on processor; skipped")
         else:
-            embeddings_processor.audio_connector.load_state_dict(a_sd, strict=True)
+            try:
+                embeddings_processor.audio_connector.load_state_dict(a_sd, strict=True)
+            except RuntimeError as exc:
+                logger.warning(
+                    "Audio connector sidecar shape mismatch (%s) — video connector loaded; audio left at init",
+                    exc,
+                )
 
 
 def _save_text_stack_sidecar(embeddings_processor: EmbeddingsProcessor, path: Path, save_dtype: torch.dtype) -> None:
@@ -154,6 +191,7 @@ class TrainingStepOutput:
     loss: Tensor  # [B,] per-element loss (unreduced)
     sigma: Tensor  # [B,] sampled sigma, detached from computational graph
     latenthdr_loss: Tensor | None = None  # scalar L_ev when latenthdr.enabled
+    av_fold_metrics: dict[str, float] | None = None
 
 
 class LtxvTrainer:
@@ -164,13 +202,21 @@ class LtxvTrainer:
             print_config(trainer_config)
         self._training_strategy = get_training_strategy(self._config.training_strategy)
         self._text_encoder = None
+        self._gemma_encode_device = "cuda"
+        self._gemma_caption_cache_dir: Path | None = None
+        self._caption_index: dict[str, str] | None = None
         self._cached_validation_embeddings = self._load_text_encoder_and_cache_embeddings()
         self._load_models()
         self._setup_accelerator()
-        self._collect_trainable_params()
+        freeze_dit = bool(self._config.model.finetune_text_stack and self._config.model.text_stack_freeze_dit)
+        if self._config.model.training_mode == "lora" and not freeze_dit:
+            self._setup_lora()
+        elif freeze_dit:
+            logger.info("text_stack_freeze_dit: skipping LoRA adapters on frozen DiT (saves VRAM)")
         self._loaded_checkpoint_path: Path | None = None
         self._load_checkpoint()
         self._prepare_models_for_training()
+        self._collect_trainable_params()
         self._dataset = None
         self._global_step = -1
         self._checkpoint_paths: list[Path] = []
@@ -178,6 +224,7 @@ class LtxvTrainer:
         self._training_state_size_warned = False
         self._wandb_run = None
         self._sigma_tracker = SigmaBucketTracker()
+        self._av_fold_sidecar_warned = False
 
         if self._config.model.finetune_text_connectors and self._config.validation.prompts:
             if self._cached_validation_embeddings and not all(
@@ -229,6 +276,7 @@ class LtxvTrainer:
         self._init_dataloader()
         data_iter = iter(self._dataloader)
         self._init_timestep_sampler()
+        self._maybe_warm_gemma_caption_cache()
 
         # Synchronize all processes after initialization
         self._accelerator.wait_for_everyone()
@@ -286,8 +334,25 @@ class LtxvTrainer:
                 step_start_time = time.time()
                 with self._accelerator.accumulate(self._transformer):
                     is_optimization_step = (step + 1) % cfg.optimization.gradient_accumulation_steps == 0
+                    micro_idx = (step % cfg.optimization.gradient_accumulation_steps) + 1
+                    accum = cfg.optimization.gradient_accumulation_steps
                     if is_optimization_step:
                         self._global_step += 1
+
+                    log_every = max(1, int(os.environ.get("GOPEX_TRAIN_LOG_EVERY", "1")))
+                    if (
+                        IS_MAIN_PROCESS
+                        and is_optimization_step
+                        and (log_every == 1 or self._global_step % log_every == 0)
+                    ):
+                        logger.info(
+                            "Step %s/%s starting (grad-accum micro-batch %s/%s, device=%s)",
+                            self._global_step,
+                            cfg.optimization.steps,
+                            micro_idx,
+                            accum,
+                            self._accelerator.device,
+                        )
 
                     output = self._training_step(batch)
                     self._accelerator.backward(output.loss.mean())
@@ -303,6 +368,16 @@ class LtxvTrainer:
 
                     if self._lr_scheduler is not None:
                         self._lr_scheduler.step()
+
+                    # Save checkpoint before validation so a decode/sample crash
+                    # does not throw away an interval of training progress.
+                    if (
+                        cfg.checkpoints.interval
+                        and self._global_step > 0
+                        and self._global_step % cfg.checkpoints.interval == 0
+                        and is_optimization_step
+                    ):
+                        self._save_checkpoint()
 
                     # Run validation if needed
                     if (
@@ -321,15 +396,6 @@ class LtxvTrainer:
                             sampled_videos_paths = self._sample_videos(progress)
                             if sampled_videos_paths and self._config.wandb.log_validation_videos:
                                 self._log_validation_samples(sampled_videos_paths, cfg.validation.prompts)
-
-                    # Save checkpoint if needed
-                    if (
-                        cfg.checkpoints.interval
-                        and self._global_step > 0
-                        and self._global_step % cfg.checkpoints.interval == 0
-                        and is_optimization_step
-                    ):
-                        self._save_checkpoint()
 
                     self._accelerator.wait_for_everyone()
 
@@ -363,8 +429,35 @@ class LtxvTrainer:
                         }
                         if output.latenthdr_loss is not None:
                             metrics["train/latenthdr_ev_loss"] = float(output.latenthdr_loss.detach().item())
+                        if output.av_fold_metrics:
+                            metrics.update({f"train/{k}": v for k, v in output.av_fold_metrics.items()})
                         metrics.update(self._sigma_tracker.get_metrics())
                         self._log_metrics(metrics)
+
+                    # Line-logged progress (tee/log files; independent of Rich progress bar)
+                    if IS_MAIN_PROCESS and is_optimization_step:
+                        log_every = max(1, int(os.environ.get("GOPEX_TRAIN_LOG_EVERY", "10")))
+                        if self._global_step % log_every == 0:
+                            elapsed = time.time() - train_start_time
+                            steps_done = max(1, self._global_step - initial_step)
+                            eta_s = elapsed / steps_done * max(0, remaining_steps - steps_done)
+                            fold_suffix = ""
+                            if output.av_fold_metrics:
+                                parts = [
+                                    f"{k.split('/')[-1]}={v:.3f}"
+                                    for k, v in sorted(output.av_fold_metrics.items())
+                                ]
+                                fold_suffix = " | " + " ".join(parts)
+                            logger.info(
+                                "Step %s/%s — loss=%.4f lr=%.2e %.2fs/step ETA~%s%s",
+                                self._global_step,
+                                cfg.optimization.steps,
+                                step_loss,
+                                current_lr,
+                                step_time,
+                                f"{int(eta_s // 3600)}h{int((eta_s % 3600) // 60)}m",
+                                fold_suffix,
+                            )
 
                     # Fallback logging when progress bars are disabled
                     if disable_progress_bars and IS_MAIN_PROCESS and self._global_step % 20 == 0:
@@ -441,6 +534,18 @@ class LtxvTrainer:
         conn = resolve_gopex_cuda_device("GOPEX_CONNECTOR_CUDA_DEVICE", train_dev)
         return torch.device(conn)
 
+    def _place_embeddings_processor(self) -> None:
+        """Move text connectors (and optional feature extractor) to the training connector GPU."""
+        if self._embeddings_processor is None or not torch.cuda.is_available():
+            return
+        conn_dev = self._connector_device()
+        self._embeddings_processor.video_connector.to(conn_dev)
+        if self._embeddings_processor.audio_connector is not None:
+            self._embeddings_processor.audio_connector.to(conn_dev)
+        fe = self._embeddings_processor.feature_extractor
+        if fe is not None:
+            fe.to(conn_dev)
+
     def _apply_text_connectors(
         self,
         video_features: Tensor,
@@ -503,7 +608,46 @@ class LtxvTrainer:
 
         # Use strategy to compute loss
         loss = self._training_strategy.compute_loss(video_pred, audio_pred, model_inputs)
-        sigma = model_inputs.video.sigma.detach() if model_inputs.video.enabled else model_inputs.audio.sigma.detach()
+        if model_inputs.video is not None and model_inputs.video.enabled:
+            sigma = model_inputs.video.sigma.detach()
+        elif model_inputs.audio is not None:
+            sigma = model_inputs.audio.sigma.detach()
+        else:
+            raise RuntimeError("Training step produced no enabled video or audio modality")
+
+        av_fold_metrics: dict[str, float] | None = None
+        if self._config.av_fold.enabled:
+            from ltx_trainer.av_fold_training import apply_av_fold_training
+
+            with_audio = bool(getattr(self._training_strategy.config, "with_audio", False))
+            loss, av_fold_metrics = apply_av_fold_training(
+                loss,
+                batch,
+                cfg=self._config.av_fold,
+                with_audio=with_audio,
+            )
+            if IS_MAIN_PROCESS and not self._av_fold_sidecar_warned:
+                from ltx_trainer.av_fold_training import sidecar_coverage_summary
+
+                cov = sidecar_coverage_summary(batch)
+                if not any(cov.values()):
+                    allow_empty = os.environ.get("GOPEX_AV_FOLD_ALLOW_EMPTY", "").strip().lower() in (
+                        "1",
+                        "true",
+                        "yes",
+                    )
+                    require = bool(getattr(self._config.av_fold, "require_sidecars", True))
+                    msg = (
+                        "av_fold.enabled but no fold sidecars in batch — re-encode/backfill with "
+                        "GOPEX_ENABLE_AV_FOLD=1 (see documents/LTX_FOLD_HOOKS.md), or set "
+                        "GOPEX_AV_FOLD_ALLOW_EMPTY=1 / av_fold.require_sidecars=false"
+                    )
+                    if require and not allow_empty:
+                        raise RuntimeError(msg)
+                    logger.warning("%s. Training continues unweighted.", msg)
+                    self._av_fold_sidecar_warned = True
+                elif av_fold_metrics:
+                    self._av_fold_sidecar_warned = True
 
         latenthdr_loss: Tensor | None = None
         if self._config.latenthdr.enabled and self._exposure_head is not None:
@@ -517,12 +661,15 @@ class LtxvTrainer:
             if latenthdr_loss is not None:
                 loss = loss + self._config.latenthdr.lambda_ev * latenthdr_loss
 
-        return TrainingStepOutput(loss=loss, sigma=sigma, latenthdr_loss=latenthdr_loss)
+        return TrainingStepOutput(
+            loss=loss,
+            sigma=sigma,
+            latenthdr_loss=latenthdr_loss,
+            av_fold_metrics=av_fold_metrics,
+        )
 
     def _encode_live_captions(self, batch: dict) -> tuple[Tensor, Tensor | None, Tensor]:
         """Gemma encode → feature_extractor → connectors for each sample in the batch."""
-        if self._text_encoder is None:
-            raise RuntimeError("Live caption training requires text_encoder (finetune_text_stack + text_stack_live_captions)")
         raw = batch.get("caption")
         if raw is None:
             raise KeyError("Batch missing 'caption'; set data.dataset_manifest_path for live text-stack training")
@@ -534,11 +681,53 @@ class LtxvTrainer:
         mask_parts: list[Tensor] = []
 
         proc_device = str(self._accelerator.device)
-        for caption in captions:
-            hidden_states, prompt_mask = self._text_encoder.encode(caption, padding_side="left")
-            hidden_states, prompt_mask = move_gemma_encode_outputs_to_device(
-                hidden_states, prompt_mask, proc_device
+        encode_dev = self._gemma_encode_device
+        cache_dir = self._gemma_caption_cache_dir
+        from ltx_trainer.text_stack_utils import (
+            gemma_caption_cache_enabled,
+            load_gemma_caption_cache,
+            save_gemma_caption_cache,
+        )
+
+        cache_only = (
+            self._text_encoder is None
+            and cache_dir is not None
+            and gemma_caption_cache_enabled()
+        )
+        if self._text_encoder is None and not cache_only:
+            raise RuntimeError(
+                "Live caption training requires text_encoder or a populated gemma_caption_cache "
+                "(finetune_text_stack + text_stack_live_captions)"
             )
+
+        for caption in captions:
+            hidden_states: tuple[Tensor, ...] | Tensor
+            prompt_mask: Tensor
+            cached = None
+            if cache_dir is not None and gemma_caption_cache_enabled():
+                cached = load_gemma_caption_cache(cache_dir, caption)
+            if cached is not None:
+                hidden_states, prompt_mask = move_gemma_encode_outputs_to_device(
+                    cached[0], cached[1], proc_device
+                )
+            else:
+                if self._text_encoder is None:
+                    raise RuntimeError(
+                        f"Gemma caption cache miss and text encoder unloaded (caption hash "
+                        f"{caption[:48]!r}…). Re-run with GOPEX_GEMMA_UNLOAD_AFTER_CACHE=0 or delete "
+                        f"{cache_dir} and restart to re-warm."
+                    )
+                encoded = self._text_encoder.encode([caption], padding_side="left")
+                hidden_states, prompt_mask = encoded[0] if isinstance(encoded, list) else encoded
+                if cache_dir is not None and gemma_caption_cache_enabled():
+                    save_gemma_caption_cache(cache_dir, caption, hidden_states, prompt_mask)
+                hidden_states, prompt_mask = move_gemma_encode_outputs_to_device(
+                    hidden_states, prompt_mask, encode_dev
+                )
+                if encode_dev != proc_device:
+                    hidden_states, prompt_mask = move_gemma_encode_outputs_to_device(
+                        hidden_states, prompt_mask, proc_device
+                    )
             out = self._embeddings_processor.process_hidden_states(hidden_states, prompt_mask, "left")
             video_parts.append(out.video_encoding)
             mask_parts.append(out.attention_mask)
@@ -549,6 +738,57 @@ class LtxvTrainer:
         attention_mask = torch.cat(mask_parts, dim=0).to(device)
         audio_embeds = torch.cat(audio_parts, dim=0).to(device) if audio_parts else None
         return video_embeds, audio_embeds, attention_mask
+
+    def _maybe_warm_gemma_caption_cache(self) -> None:
+        """One-time Gemma encode per unique manifest caption (disk cache for training steps)."""
+        if self._text_encoder is None or not self._caption_index:
+            return
+        from ltx_trainer.text_stack_utils import (
+            gemma_caption_cache_enabled,
+            gemma_caption_cache_path,
+            save_gemma_caption_cache,
+        )
+
+        if not gemma_caption_cache_enabled():
+            return
+        cache_dir = self._gemma_caption_cache_dir or (Path(self._config.output_dir) / "gemma_caption_cache")
+        self._gemma_caption_cache_dir = cache_dir
+        unique = sorted(set(self._caption_index.values()))
+        missing = [c for c in unique if not gemma_caption_cache_path(cache_dir, c).is_file()]
+        if not missing:
+            logger.info("Gemma caption cache: %s entries, all present under %s", len(unique), cache_dir)
+            if os.environ.get("GOPEX_GEMMA_UNLOAD_AFTER_CACHE", "1").strip().lower() not in ("0", "false", "no"):
+                self._unload_live_gemma_encoder()
+            return
+        logger.info(
+            "Warming Gemma caption cache: %s new / %s unique captions → %s",
+            len(missing),
+            len(unique),
+            cache_dir,
+        )
+        t0 = time.time()
+        for i, caption in enumerate(missing, start=1):
+            encoded = self._text_encoder.encode([caption], padding_side="left")
+            hidden_states, prompt_mask = encoded[0] if isinstance(encoded, list) else encoded
+            save_gemma_caption_cache(cache_dir, caption, hidden_states, prompt_mask)
+            if i == 1 or i % 25 == 0 or i == len(missing):
+                logger.info("Gemma cache warm %s/%s (%.0fs elapsed)", i, len(missing), time.time() - t0)
+        logger.info("Gemma caption cache ready (%s files, %.0fs)", len(unique), time.time() - t0)
+        if os.environ.get("GOPEX_GEMMA_UNLOAD_AFTER_CACHE", "1").strip().lower() not in ("0", "false", "no"):
+            self._unload_live_gemma_encoder()
+
+    def _unload_live_gemma_encoder(self) -> None:
+        """Drop Gemma weights after caption cache warm (training uses disk cache only)."""
+        if self._text_encoder is None:
+            return
+        import gc
+
+        del self._text_encoder
+        self._text_encoder = None
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        logger.info("Unloaded Gemma text encoder after caption cache warm (training uses cache only)")
 
     @free_gpu_memory_context(after=True)
     def _load_text_encoder_and_cache_embeddings(self) -> list[CachedPromptEmbeddings] | None:
@@ -568,12 +808,28 @@ class LtxvTrainer:
             )
 
         # Load text encoder (pure Gemma LLM)
+        freeze_dit = bool(self._config.model.finetune_text_stack and self._config.model.text_stack_freeze_dit)
+        gemma_device = _resolve_gemma_load_device(freeze_dit, startup_device)
+        self._gemma_encode_device = gemma_device
+        gemma_8bit = bool(self._config.acceleration.load_text_encoder_in_8bit) and gemma_device != "cpu"
+        if freeze_dit:
+            if gemma_device == "cpu":
+                logger.info(
+                    "text_stack_freeze_dit: Gemma bf16 on CPU (GOPEX_GEMMA_ENCODE_CPU); "
+                    "int8 DiT + trainable stack on training GPU"
+                )
+            else:
+                logger.info(
+                    "text_stack_freeze_dit: Gemma %s on %s; int8 DiT + trainable stack on training GPU",
+                    "8bit" if gemma_8bit else "bf16",
+                    gemma_device,
+                )
         logger.debug("Loading text encoder...")
         text_encoder = load_text_encoder(
             gemma_model_path=self._config.model.text_encoder_path,
-            device=startup_device,
+            device=gemma_device,
             dtype=torch.bfloat16,
-            load_in_8bit=self._config.acceleration.load_text_encoder_in_8bit,
+            load_in_8bit=gemma_8bit,
         )
 
         # Load embeddings processor (feature extractor + connectors)
@@ -598,8 +854,10 @@ class LtxvTrainer:
             cache_pre_connector = bool(self._config.model.finetune_text_connectors)
             with torch.inference_mode():
                 for prompt in self._config.validation.prompts:
-                    pos_hs, pos_mask = text_encoder.encode(prompt)
-                    neg_hs, neg_mask = text_encoder.encode(self._config.validation.negative_prompt)
+                    pos_encoded = text_encoder.encode([prompt])
+                    neg_encoded = text_encoder.encode([self._config.validation.negative_prompt])
+                    pos_hs, pos_mask = pos_encoded[0] if isinstance(pos_encoded, list) else pos_encoded
+                    neg_hs, neg_mask = neg_encoded[0] if isinstance(neg_encoded, list) else neg_encoded
                     pos_hs, pos_mask = move_gemma_encode_outputs_to_device(pos_hs, pos_mask, startup_device)
                     neg_hs, neg_mask = move_gemma_encode_outputs_to_device(neg_hs, neg_mask, startup_device)
                     if cache_pre_connector:
@@ -635,9 +893,14 @@ class LtxvTrainer:
         keep_live = bool(self._config.model.finetune_text_stack and self._config.model.text_stack_live_captions)
         if keep_live:
             self._text_encoder = text_encoder
-            logger.info(
-                "finetune_text_stack: keeping Gemma text encoder and feature_extractor on GPU for live captions"
-            )
+            if freeze_dit:
+                logger.info(
+                    "finetune_text_stack: Gemma on CPU for encode; feature_extractor + frozen DiT on training GPU"
+                )
+            else:
+                logger.info(
+                    "finetune_text_stack: keeping Gemma text encoder and feature_extractor on GPU for live captions"
+                )
         else:
             del text_encoder
 
@@ -655,7 +918,7 @@ class LtxvTrainer:
         # Load audio components if:
         # 1. Training strategy requires audio (training the audio branch), OR
         # 2. Validation is configured to generate audio (even if not training audio)
-        load_audio = self._training_strategy.requires_audio or self._config.validation.generate_audio
+        load_audio = strategy_requires_audio(self._config.training_strategy) or self._config.validation.generate_audio
 
         # Check if we need VAE encoder (for image or reference video conditioning)
         need_vae_encoder = (
@@ -719,7 +982,7 @@ class LtxvTrainer:
         if freeze_dit:
             self._transformer.requires_grad_(False)
         elif self._config.model.training_mode == "lora":
-            self._setup_lora()
+            pass  # LoRA adapter attached before checkpoint load
         elif self._config.model.training_mode == "full":
             self._transformer.requires_grad_(True)
         else:
@@ -835,6 +1098,9 @@ class LtxvTrainer:
 
         if self._config.model.training_mode == "full":
             self._load_full_checkpoint(checkpoint_path)
+        elif self._text_stack_freeze_dit_enabled() and "text_stack" in checkpoint_path.name:
+            self._maybe_load_text_stack_checkpoint(checkpoint_path)
+            logger.info("Loaded text stack checkpoint (frozen DiT — no LoRA weights)")
         else:  # LoRA mode
             self._load_lora_checkpoint(checkpoint_path)
 
@@ -1013,12 +1279,7 @@ class LtxvTrainer:
 
         if self._embeddings_processor is not None and torch.cuda.is_available():
             conn_dev = self._connector_device()
-            self._embeddings_processor.video_connector.to(conn_dev)
-            if self._embeddings_processor.audio_connector is not None:
-                self._embeddings_processor.audio_connector.to(conn_dev)
-            fe = self._embeddings_processor.feature_extractor
-            if fe is not None:
-                fe.to(conn_dev)
+            self._place_embeddings_processor()
             if conn_dev != self._accelerator.device:
                 logger.info(
                     "Text connectors on %s; DiT LoRA on %s (GOPEX_CONNECTOR_CUDA_DEVICE)",
@@ -1034,9 +1295,23 @@ class LtxvTrainer:
             if not self._config.latenthdr.train_exposure_head:
                 self._exposure_head.eval()
 
+        train_dev = self._accelerator.device
+        if train_dev.type == "cuda":
+            self._transformer.to(train_dev)
+        else:
+            logger.warning(
+                "Accelerate device is %s — training will be extremely slow. "
+                "Reboot to fix NVML/driver mismatch or unset CUDA_VISIBLE_DEVICES.",
+                train_dev,
+            )
+
         # Log GPU memory usage after model preparation
-        vram_usage_gb = torch.cuda.memory_allocated() / 1024**3
-        logger.debug(f"GPU memory usage after models preparation: {vram_usage_gb:.2f} GB")
+        if train_dev.type == "cuda":
+            idx = train_dev.index if train_dev.index is not None else torch.cuda.current_device()
+            vram_usage_gb = torch.cuda.memory_allocated(idx) / 1024**3
+            logger.debug(f"GPU memory usage after models preparation: {vram_usage_gb:.2f} GB on cuda:{idx}")
+        else:
+            logger.debug("GPU memory usage after models preparation: n/a (device %s)", train_dev)
 
     @staticmethod
     def _find_checkpoint(checkpoint_path: str | Path) -> Path | None:
@@ -1072,13 +1347,14 @@ class LtxvTrainer:
         """Initialize the training data loader using the strategy's data sources."""
         if self._dataset is None:
             # Get data sources from the training strategy
-            data_sources = self._training_strategy.get_data_sources()
+            data_sources = self._config.training_strategy.get_data_sources()
 
             caption_index = None
             if self._config.model.finetune_text_stack and self._config.model.text_stack_live_captions:
                 from ltx_trainer.text_stack_utils import load_caption_index
 
                 caption_index = load_caption_index(self._config.data.dataset_manifest_path)
+            self._caption_index = caption_index
             self._dataset = PrecomputedDataset(
                 self._config.data.preprocessed_data_root,
                 data_sources=data_sources,
@@ -1087,12 +1363,60 @@ class LtxvTrainer:
             logger.debug(f"Loaded dataset with {len(self._dataset):,} samples from sources: {list(data_sources)}")
             if caption_index:
                 logger.info("Live captions: %s manifest entries", f"{len(caption_index):,}")
+                if self._text_encoder is not None:
+                    from ltx_trainer.text_stack_utils import gemma_caption_cache_enabled
+
+                    if gemma_caption_cache_enabled():
+                        self._gemma_caption_cache_dir = Path(self._config.output_dir) / "gemma_caption_cache"
+            sampling_mode = self._config.data.project_sampling_mode
+            if sampling_mode != "uniform" and getattr(self._dataset, "project_groups", None):
+                from ltx_trainer.project_sampling import compute_project_sample_weights, summarize_project_groups
+
+                groups = self._dataset.project_groups
+                weights = compute_project_sample_weights(groups, mode=sampling_mode)
+                summary = summarize_project_groups(groups)
+                logger.info(
+                    "Project sampling mode=%s across %s projects (top uniform share: %s=%.1f%% → balanced %.1f%% each)",
+                    sampling_mode,
+                    len(groups),
+                    summary[0]["project"] if summary else "?",
+                    float(summary[0]["uniform_pct"]) if summary else 0.0,
+                    float(summary[0]["balanced_pct"]) if summary else 0.0,
+                )
+                for row in summary[:8]:
+                    logger.debug(
+                        "  %s: %s clips (uniform %.1f%%, %s target %.1f%%/proj)",
+                        row["project"],
+                        row["clips"],
+                        row["uniform_pct"],
+                        sampling_mode,
+                        row["balanced_pct"],
+                    )
+                if len(summary) > 8:
+                    logger.debug("  … and %s more projects", len(summary) - 8)
 
         num_workers = self._config.data.num_dataloader_workers
+        sampler = None
+        shuffle = True
+        if self._dataset is not None and self._config.data.project_sampling_mode != "uniform":
+            from ltx_trainer.project_sampling import compute_project_sample_weights
+
+            weights = compute_project_sample_weights(
+                self._dataset.project_groups,
+                mode=self._config.data.project_sampling_mode,
+            )
+            sampler = WeightedRandomSampler(
+                weights=torch.as_tensor(weights, dtype=torch.double),
+                num_samples=len(weights),
+                replacement=True,
+            )
+            shuffle = False
+
         dataloader = DataLoader(
             self._dataset,
             batch_size=self._config.optimization.batch_size,
-            shuffle=True,
+            shuffle=shuffle,
+            sampler=sampler,
             drop_last=True,
             num_workers=num_workers,
             pin_memory=num_workers > 0,
@@ -1116,9 +1440,18 @@ class LtxvTrainer:
         n_trainable = sum(p.numel() for p in self._trainable_params)
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-        if opt_cfg.optimizer_type == "adamw":
+        use_8bit = opt_cfg.optimizer_type == "adamw8bit"
+        if use_8bit and self._trainable_params and not all(p.is_cuda for p in self._trainable_params):
+            logger.warning(
+                "Trainable parameters are not on CUDA; AdamW8bit requires GPU. Falling back to AdamW."
+            )
+            use_8bit = False
+
+        if opt_cfg.optimizer_type == "adamw" or (opt_cfg.optimizer_type == "adamw8bit" and not use_8bit):
             optimizer = AdamW(self._trainable_params, lr=lr)
-        elif opt_cfg.optimizer_type == "adamw8bit":
+            if opt_cfg.optimizer_type == "adamw8bit":
+                logger.info("Using AdamW for %s trainable parameters", f"{n_trainable:,}")
+        elif use_8bit:
             # noinspection PyUnresolvedReferences
             from bitsandbytes.optim import AdamW8bit  # noqa: PLC0415
 
@@ -1139,7 +1472,10 @@ class LtxvTrainer:
         """Create learning rate scheduler based on config."""
         scheduler_type = self._config.optimization.scheduler_type
         steps = self._config.optimization.steps
-        params = self._config.optimization.scheduler_params or {}
+        params = dict(self._config.optimization.scheduler_params or {})
+        # warmup_steps is a Gopex/diffusers-style param; PyTorch cosine/step schedulers
+        # do not accept it — apply via SequentialLR when present.
+        warmup_steps = int(params.pop("warmup_steps", 0) or 0)
 
         if scheduler_type is None:
             return None
@@ -1153,16 +1489,17 @@ class LtxvTrainer:
                 **params,
             )
         elif scheduler_type == "cosine":
+            cosine_steps = max(steps - warmup_steps, 1)
             scheduler = CosineAnnealingLR(
                 optimizer,
-                T_max=steps,
+                T_max=cosine_steps,
                 eta_min=params.pop("eta_min", 0),
                 **params,
             )
         elif scheduler_type == "cosine_with_restarts":
             scheduler = CosineAnnealingWarmRestarts(
                 optimizer,
-                T_0=params.pop("T_0", steps // 4),
+                T_0=params.pop("T_0", max(steps // 4, 1)),
                 T_mult=params.pop("T_mult", 1),
                 eta_min=params.pop("eta_min", 5e-5),
                 **params,
@@ -1185,6 +1522,19 @@ class LtxvTrainer:
             scheduler = None
         else:
             raise ValueError(f"Unknown scheduler type: {scheduler_type}")
+
+        if scheduler is not None and warmup_steps > 0:
+            warmup = LinearLR(
+                optimizer,
+                start_factor=1e-2,
+                end_factor=1.0,
+                total_iters=warmup_steps,
+            )
+            scheduler = SequentialLR(
+                optimizer,
+                schedulers=[warmup, scheduler],
+                milestones=[warmup_steps],
+            )
 
         return scheduler
 
@@ -1339,9 +1689,36 @@ class LtxvTrainer:
         # Clean up progress tasks
         sampling_ctx.cleanup()
 
+        # ValidationSampler parks the text stack on CPU for DiT VRAM; restore before training resumes.
+        self._place_embeddings_processor()
+
         rel_outputs_path = output_dir.relative_to(self._config.output_dir)
         logger.info(f"🎥 Validation samples for step {self._global_step} saved in {rel_outputs_path}")
+        self._maybe_assert_validation_quality(video_paths)
         return video_paths
+
+    def _maybe_assert_validation_quality(self, sampled_videos_paths: list[Path] | None) -> None:
+        """Abort training when validation MP4s look like color noise (env GOPEX_VALIDATION_QUALITY_GATE=1)."""
+        if not IS_MAIN_PROCESS or not sampled_videos_paths:
+            return
+        gate = os.environ.get("GOPEX_VALIDATION_QUALITY_GATE", "").strip().lower()
+        if gate not in ("1", "true", "yes"):
+            return
+        min_lap = float(os.environ.get("GOPEX_VALIDATION_MIN_LAP", "80"))
+        from ltx_trainer.validation_quality import assert_samples_ok
+
+        try:
+            reports = assert_samples_ok(sampled_videos_paths, min_laplacian_var=min_lap)
+        except RuntimeError as exc:
+            logger.error("Validation quality gate failed at step %s: %s", self._global_step, exc)
+            raise SystemExit(2) from exc
+        for r in reports:
+            logger.info(
+                "Validation quality OK: %s lap=%.1f luma=%.1f",
+                r.path.name,
+                r.laplacian_var,
+                r.mean_luma,
+            )
 
     @staticmethod
     def _log_training_stats(stats: TrainingStats) -> None:
@@ -1358,10 +1735,14 @@ class LtxvTrainer:
             stats_str += f" - Global batch size: {stats.global_batch_size}"
         logger.info(stats_str)
 
+    def _text_stack_freeze_dit_enabled(self) -> bool:
+        return bool(self._config.model.finetune_text_stack and self._config.model.text_stack_freeze_dit)
+
     def _save_checkpoint(self) -> Path | None:
         """Save the model weights."""
         is_lora = self._config.model.training_mode == "lora"
         is_fsdp = self._accelerator.distributed_type == DistributedType.FSDP
+        freeze_dit = self._text_stack_freeze_dit_enabled()
 
         # Prepare paths
         save_dir = Path(self._config.output_dir) / "checkpoints"
@@ -1371,6 +1752,25 @@ class LtxvTrainer:
 
         # Get state dict (collective operation - all processes must participate)
         self._accelerator.wait_for_everyone()
+
+        if freeze_dit:
+            if not IS_MAIN_PROCESS:
+                return None
+            save_dir.mkdir(exist_ok=True, parents=True)
+            save_dtype = torch.bfloat16 if self._config.checkpoints.precision == "bfloat16" else torch.float32
+            saved_weights_path = save_dir / f"text_stack_weights_step_{self._global_step:05d}.safetensors"
+            _save_text_stack_sidecar(self._embeddings_processor, saved_weights_path, save_dtype)
+            rel_path = saved_weights_path.relative_to(self._config.output_dir)
+            logger.info(
+                "Text stack weights for step %s saved in %s (frozen DiT — no LoRA checkpoint)",
+                self._global_step,
+                rel_path,
+            )
+            self._checkpoint_paths.append(saved_weights_path)
+            self._cleanup_checkpoints()
+            self._save_training_state(save_dir)
+            return saved_weights_path
+
         full_state_dict = self._accelerator.get_state_dict(self._transformer)
 
         if not IS_MAIN_PROCESS:

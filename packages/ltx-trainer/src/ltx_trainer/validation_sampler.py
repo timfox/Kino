@@ -27,6 +27,8 @@ from ltx_core.guidance.perturbations import (
 )
 from ltx_core.model.transformer.modality import Modality
 from ltx_core.model.transformer.model import X0Model
+from ltx_trainer.dyna_pruner.env import dyna_pruner_enabled
+from ltx_trainer.dyna_pruner.inference import perturbation_config_for_latent
 from ltx_core.model.video_vae import SpatialTilingConfig, TemporalTilingConfig, TilingConfig
 from ltx_core.tools import AudioLatentTools, VideoLatentTools
 from ltx_core.types import AudioLatentShape, LatentState, SpatioTemporalScaleFactors, VideoLatentShape, VideoPixelShape
@@ -88,6 +90,7 @@ class GenerationConfig:
     frame_rate: float = 25.0  # Frame rate for temporal position scaling
     num_inference_steps: int = 30  # Number of denoising steps
     guidance_scale: float = 4.0  # CFG guidance scale
+    adamag_guidance: bool = False  # Time-varying CFG scale (AdaMaG ω(t); arXiv:2605.20079)
     seed: int = 42  # Random seed for reproducibility
     condition_image: Tensor | None = None  # Optional first frame image for image-to-video
     reference_video: Tensor | None = None  # For IC-LoRA: [F, C, H, W] in [0, 1]
@@ -227,6 +230,10 @@ class ValidationSampler:
             device=device,
         )
 
+        ctx = self._sampling_context
+        if ctx is not None and hasattr(ctx, "set_phase"):
+            ctx.set_phase("decode · video VAE")
+
         # Decode outputs
         video_state = video_tools.clear_conditioning(video_state)
         video_state = video_tools.unpatchify(video_state)
@@ -234,9 +241,14 @@ class ValidationSampler:
 
         audio_output = None
         if audio_state is not None and audio_tools is not None:
+            if ctx is not None and hasattr(ctx, "set_phase"):
+                ctx.set_phase("decode · audio VAE + vocoder")
             audio_state = audio_tools.clear_conditioning(audio_state)
             audio_state = audio_tools.unpatchify(audio_state)
             audio_output = self._decode_audio(audio_state, device)
+
+        if ctx is not None and hasattr(ctx, "set_phase"):
+            ctx.set_phase("done")
 
         return video_output, audio_output
 
@@ -496,11 +508,28 @@ class ValidationSampler:
         scheduler = LTX2Scheduler()
         sigmas = scheduler.execute(steps=config.num_inference_steps).to(device).float()
         stepper = EulerDiffusionStep()
-        cfg_guider = CFGGuider(config.guidance_scale)
         stg_guider = STGGuider(config.stg_scale)
+        total_denoise_steps = max(1, len(sigmas) - 1)
 
-        # Build STG perturbation config if STG is enabled
+        # Build STG / Dyna-Pruner perturbation configs
         stg_perturbation_config = self._build_stg_perturbation_config(config) if stg_guider.enabled() else None
+        dyna_only_pert = (
+            perturbation_config_for_latent(video_state.latent, batch_size=video_state.latent.shape[0])
+            if dyna_pruner_enabled()
+            else None
+        )
+        dyna_stg_pert = (
+            perturbation_config_for_latent(
+                video_state.latent,
+                batch_size=video_state.latent.shape[0],
+                stg_blocks=config.stg_blocks,
+                stg_mode=config.stg_mode,
+            )
+            if dyna_pruner_enabled() and stg_guider.enabled()
+            else None
+        )
+        pos_perturbations = dyna_only_pert if dyna_pruner_enabled() else None
+        stg_perturbations = dyna_stg_pert if dyna_stg_pert is not None else stg_perturbation_config
 
         # Create initial modalities (will be updated each step via replace())
         video = Modality(
@@ -527,6 +556,21 @@ class ValidationSampler:
             )
 
         # Wrap transformer with X0Model to convert velocity predictions to denoised outputs
+        if self._text_encoder is not None:
+            self._text_encoder.to("cpu")
+        if self._embeddings_processor is not None:
+            self._embeddings_processor.to("cpu")
+        torch.cuda.empty_cache()
+        from ltx_trainer import logger
+
+        logger.debug(
+            "Moving transformer to %s for %s denoising steps (text stack off GPU)",
+            device,
+            len(sigmas) - 1,
+        )
+        ctx = self._sampling_context
+        if ctx is not None and hasattr(ctx, "set_phase"):
+            ctx.set_phase("denoise · DiT on GPU (1st step can be slow)")
         self._transformer.to(device)
         x0_model = X0Model(self._transformer)
 
@@ -551,10 +595,20 @@ class ValidationSampler:
                     )
 
                 # Run model (positive pass) - X0Model returns denoised outputs
-                pos_video, pos_audio = x0_model(video=video, audio=audio, perturbations=None)
+                pos_video, pos_audio = x0_model(video=video, audio=audio, perturbations=pos_perturbations)
                 denoised_video, denoised_audio = pos_video, pos_audio
 
                 # Apply CFG if guidance_scale != 1.0
+                cfg_scale = config.guidance_scale
+                if config.adamag_guidance:
+                    from ltx_trainer.adamag.sampling import effective_guidance_scale
+
+                    cfg_scale = effective_guidance_scale(
+                        config.guidance_scale,
+                        step_index=step_idx,
+                        total_steps=total_denoise_steps,
+                    )
+                cfg_guider = CFGGuider(cfg_scale)
                 if cfg_guider.enabled() and v_ctx_neg is not None:
                     video_neg = replace(video, context=v_ctx_neg)
                     audio_neg = replace(audio, context=a_ctx_neg) if audio is not None else None
@@ -565,9 +619,9 @@ class ValidationSampler:
                         denoised_audio = denoised_audio + cfg_guider.delta(pos_audio, neg_audio)
 
                 # Apply STG if stg_scale != 0.0
-                if stg_guider.enabled() and stg_perturbation_config is not None:
+                if stg_guider.enabled() and stg_perturbations is not None:
                     perturbed_video, perturbed_audio = x0_model(
-                        video=video, audio=audio, perturbations=stg_perturbation_config
+                        video=video, audio=audio, perturbations=stg_perturbations
                     )
                     denoised_video = denoised_video + stg_guider.delta(pos_video, perturbed_video)
                     if audio is not None and denoised_audio is not None and perturbed_audio is not None:
@@ -749,18 +803,22 @@ class ValidationSampler:
         self._text_encoder.to(device)
         self._embeddings_processor.to(device)
 
-        pos_hs, pos_mask = self._text_encoder.encode(config.prompt)
+        pos_encoded = self._text_encoder.encode([config.prompt])
+        pos_hs, pos_mask = pos_encoded[0] if isinstance(pos_encoded, list) else pos_encoded
         pos_out = self._embeddings_processor.process_hidden_states(pos_hs, pos_mask)
         v_ctx_pos, a_ctx_pos = pos_out.video_encoding, pos_out.audio_encoding
 
         v_ctx_neg, a_ctx_neg = None, None
         if config.guidance_scale != 1.0:
-            neg_hs, neg_mask = self._text_encoder.encode(config.negative_prompt)
+            neg_encoded = self._text_encoder.encode([config.negative_prompt])
+            neg_hs, neg_mask = neg_encoded[0] if isinstance(neg_encoded, list) else neg_encoded
             neg_out = self._embeddings_processor.process_hidden_states(neg_hs, neg_mask)
             v_ctx_neg, a_ctx_neg = neg_out.video_encoding, neg_out.audio_encoding
 
-        # Move the base Gemma model to CPU
+        # Free GPU for DiT denoising (22B transformer needs most of the card).
         self._text_encoder.model.to("cpu")
+        self._embeddings_processor.to("cpu")
+        torch.cuda.empty_cache()
 
         return v_ctx_pos, a_ctx_pos, v_ctx_neg, a_ctx_neg
 

@@ -26,6 +26,11 @@ from ltx_trainer.nvml_safe_cuda import apply_nvml_safe_cuda_patches
 apply_nvml_safe_cuda_patches()
 
 import torch
+from ltx_core.loader.helpers import (
+    read_ltx_checkpoint_config,
+    resolve_audio_vae_checkpoint_path,
+    resolve_vae_checkpoint_path,
+)
 
 # Type alias for device specification
 Device = str | torch.device
@@ -63,17 +68,26 @@ def load_transformer(
     Returns:
         Loaded LTXModel transformer
     """
+    from ltx_core.loader.helpers import resolve_ltx_checkpoint_paths
     from ltx_core.loader.single_gpu_model_builder import SingleGPUModelBuilder
+    from ltx_core.loader.sft_loader import SafetensorsModelStateDictLoader
     from ltx_core.model.transformer.model_configurator import (
         LTXV_MODEL_COMFY_RENAMING_MAP,
         LTXModelConfigurator,
     )
 
-    return SingleGPUModelBuilder(
-        model_path=str(checkpoint_path),
+    loader = SafetensorsModelStateDictLoader()
+    shard_paths = resolve_ltx_checkpoint_paths(checkpoint_path)
+    builder_path: str | tuple[str, ...] = shard_paths if len(shard_paths) != 1 else shard_paths[0]
+    ck_cfg = read_ltx_checkpoint_config(checkpoint_path, loader)
+    builder = SingleGPUModelBuilder(
+        model_path=builder_path,
         model_class_configurator=LTXModelConfigurator,
         model_sd_ops=LTXV_MODEL_COMFY_RENAMING_MAP,
-    ).build(device=_to_torch_device(device), dtype=dtype)
+    )
+    if ck_cfg:
+        builder = builder.with_checkpoint_config(ck_cfg)
+    return builder.build(device=_to_torch_device(device), dtype=dtype)
 
 
 def load_video_vae_encoder(
@@ -92,8 +106,9 @@ def load_video_vae_encoder(
     from ltx_core.loader.single_gpu_model_builder import SingleGPUModelBuilder
     from ltx_core.model.video_vae import VAE_ENCODER_COMFY_KEYS_FILTER, VideoEncoderConfigurator
 
+    vae_path = resolve_vae_checkpoint_path(checkpoint_path)
     return SingleGPUModelBuilder(
-        model_path=str(checkpoint_path),
+        model_path=str(vae_path),
         model_class_configurator=VideoEncoderConfigurator,
         model_sd_ops=VAE_ENCODER_COMFY_KEYS_FILTER,
     ).build(device=_to_torch_device(device), dtype=dtype)
@@ -115,8 +130,9 @@ def load_video_vae_decoder(
     from ltx_core.loader.single_gpu_model_builder import SingleGPUModelBuilder
     from ltx_core.model.video_vae import VAE_DECODER_COMFY_KEYS_FILTER, VideoDecoderConfigurator
 
+    vae_path = resolve_vae_checkpoint_path(checkpoint_path)
     return SingleGPUModelBuilder(
-        model_path=str(checkpoint_path),
+        model_path=str(vae_path),
         model_class_configurator=VideoDecoderConfigurator,
         model_sd_ops=VAE_DECODER_COMFY_KEYS_FILTER,
     ).build(device=_to_torch_device(device), dtype=dtype)
@@ -138,8 +154,9 @@ def load_audio_vae_encoder(
     from ltx_core.loader import SingleGPUModelBuilder
     from ltx_core.model.audio_vae import AUDIO_VAE_ENCODER_COMFY_KEYS_FILTER, AudioEncoderConfigurator
 
+    vae_path = resolve_audio_vae_checkpoint_path(checkpoint_path)
     return SingleGPUModelBuilder(
-        model_path=str(checkpoint_path),
+        model_path=str(vae_path),
         model_class_configurator=AudioEncoderConfigurator,
         model_sd_ops=AUDIO_VAE_ENCODER_COMFY_KEYS_FILTER,
     ).build(device=_to_torch_device(device), dtype=dtype)
@@ -161,8 +178,9 @@ def load_audio_vae_decoder(
     from ltx_core.loader import SingleGPUModelBuilder
     from ltx_core.model.audio_vae import AUDIO_VAE_DECODER_COMFY_KEYS_FILTER, AudioDecoderConfigurator
 
+    vae_path = resolve_audio_vae_checkpoint_path(checkpoint_path)
     return SingleGPUModelBuilder(
-        model_path=str(checkpoint_path),
+        model_path=str(vae_path),
         model_class_configurator=AudioDecoderConfigurator,
         model_sd_ops=AUDIO_VAE_DECODER_COMFY_KEYS_FILTER,
     ).build(device=_to_torch_device(device), dtype=dtype)
@@ -184,8 +202,9 @@ def load_vocoder(
     from ltx_core.loader import SingleGPUModelBuilder
     from ltx_core.model.audio_vae import VOCODER_COMFY_KEYS_FILTER, VocoderConfigurator
 
+    vae_path = resolve_audio_vae_checkpoint_path(checkpoint_path)
     return SingleGPUModelBuilder(
-        model_path=str(checkpoint_path),
+        model_path=str(vae_path),
         model_class_configurator=VocoderConfigurator,
         model_sd_ops=VOCODER_COMFY_KEYS_FILTER,
     ).build(device=_to_torch_device(device), dtype=dtype)
@@ -215,7 +234,7 @@ def load_text_encoder(
     if load_in_8bit:
         from ltx_trainer.gemma_8bit import load_8bit_gemma
 
-        return load_8bit_gemma(gemma_model_path, dtype)
+        return load_8bit_gemma(gemma_model_path, dtype, device=device)
 
     # Standard loading path
     from ltx_core.loader.single_gpu_model_builder import SingleGPUModelBuilder
@@ -281,7 +300,11 @@ def load_embeddings_processor(
     Returns:
         Loaded EmbeddingsProcessor with feature extractor and connectors
     """
-    from ltx_core.loader.helpers import peek_video_aggregate_embed_in_features, read_model_config
+    from ltx_core.loader.helpers import (
+        peek_video_aggregate_embed_in_features,
+        read_model_config,
+        resolve_ltx_checkpoint_paths,
+    )
     from ltx_core.loader.single_gpu_model_builder import SingleGPUModelBuilder
     from ltx_core.loader.sft_loader import SafetensorsModelStateDictLoader
     from ltx_core.text_encoders.gemma import (
@@ -295,8 +318,11 @@ def load_embeddings_processor(
     torch_device = _to_torch_device(device)
     loader = SafetensorsModelStateDictLoader()
 
+    shard_paths = resolve_ltx_checkpoint_paths(checkpoint_path)
+    builder_path: str | tuple[str, ...] = shard_paths if len(shard_paths) != 1 else shard_paths[0]
+
     builder = SingleGPUModelBuilder(
-        model_path=str(checkpoint_path),
+        model_path=builder_path,
         model_class_configurator=EmbeddingsProcessorConfigurator,
         model_sd_ops=EMBEDDINGS_PROCESSOR_KEY_OPS,
     )
@@ -306,7 +332,12 @@ def load_embeddings_processor(
         gemma_cfg = resolve_gemma_checkpoint_config(weight_paths_t)
         if gemma_encode_stack_dims is not None:
             gemma_cfg = {**gemma_cfg, "ltx_encode_stack_dims": dict(gemma_encode_stack_dims)}
-        ltx_ck = read_model_config(str(checkpoint_path), loader)
+        ltx_ck = read_ltx_checkpoint_config(checkpoint_path, loader)
+        if not ltx_ck:
+            raise ValueError(
+                f"No 'config' metadata in {checkpoint_path} (native fold shards) and LTX_CKPT unset. "
+                "Set LTX_CKPT to the base LTX .safetensors used for fold, or re-fold with config embedding."
+            )
         merged: dict = {**ltx_ck, "gemma_hf_config": gemma_cfg}
         flat_ck = peek_video_aggregate_embed_in_features(str(checkpoint_path))
         hs, ns = _gemma_text_stack_dims(gemma_cfg)

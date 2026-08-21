@@ -1,0 +1,86 @@
+"""Stance simulation audit — counterfactual context revision (arXiv:2606.06443)."""
+
+from ltx_trainer.stance_sim.audit import figure3_transition_rates, run_four_stage_audit, run_stage1_validation
+from ltx_trainer.stance_sim.config import StanceSimConfig
+from ltx_trainer.stance_sim.layout import LIMITATIONS
+from ltx_trainer.stance_sim.metrics import (
+    STANCE_ORDINAL,
+    average_directional_shift,
+    backfire_rate,
+    classification_metrics,
+    depolarization_rate,
+    directional_stance_shift,
+    pct_change_from_baseline,
+    stance_score,
+    supportive_transition_rate,
+    transition_rate,
+)
+from ltx_trainer.stance_sim.mock import ToyStanceSimulator, evaluation_smoke, run_revision_audit, sample_instances
+from ltx_trainer.stance_sim.prompts import format_revision_prompt, format_stance_prompt, prompt_bundle as stance_prompt_bundle
+from ltx_trainer.stance_sim.pipeline import (
+    benchmarks_bundle,
+    evaluation_demo,
+    figure3_transition_summary,
+    framework_card,
+    pipeline_demo,
+    table_i_baseline_stance,
+    table_ii_directional_shift,
+    table_iii_meme_ablation_methods,
+    table_iv_meme_transition_rates,
+    table_v_tone_depolarization,
+    table_vi_full_stance_models,
+    table_vii_meme_template_sensitivity,
+    table_viii_prompt_temperature_agreement,
+)
+from ltx_trainer.stance_sim.revision import (
+    ConversationInstance,
+    RevisionStrategy,
+    meme_text_payload,
+    revise_message,
+    revise_tone,
+    simulate_revised_stance,
+)
+
+__all__ = [
+    "ConversationInstance",
+    "LIMITATIONS",
+    "RevisionStrategy",
+    "STANCE_ORDINAL",
+    "StanceSimConfig",
+    "ToyStanceSimulator",
+    "average_directional_shift",
+    "backfire_rate",
+    "benchmarks_bundle",
+    "classification_metrics",
+    "depolarization_rate",
+    "directional_stance_shift",
+    "evaluation_demo",
+    "evaluation_smoke",
+    "figure3_transition_rates",
+    "figure3_transition_summary",
+    "format_revision_prompt",
+    "format_stance_prompt",
+    "framework_card",
+    "meme_text_payload",
+    "pct_change_from_baseline",
+    "pipeline_demo",
+    "revise_message",
+    "revise_tone",
+    "run_four_stage_audit",
+    "run_revision_audit",
+    "run_stage1_validation",
+    "sample_instances",
+    "stance_prompt_bundle",
+    "simulate_revised_stance",
+    "stance_score",
+    "supportive_transition_rate",
+    "table_i_baseline_stance",
+    "table_ii_directional_shift",
+    "table_iii_meme_ablation_methods",
+    "table_iv_meme_transition_rates",
+    "table_v_tone_depolarization",
+    "table_vi_full_stance_models",
+    "table_vii_meme_template_sensitivity",
+    "table_viii_prompt_temperature_agreement",
+    "transition_rate",
+]

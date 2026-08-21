@@ -24,8 +24,9 @@ bootstrap_kino_pythonpath()
 
 # NVML-safe CUDA alloc must run before ``import torch`` anywhere in the process.
 try:
-    from ltx_trainer.nvml_safe_cuda import apply_nvml_safe_cuda_patches
+    from ltx_trainer.nvml_safe_cuda import apply_nvml_safe_cuda_patches, pin_training_cuda_device
 
     apply_nvml_safe_cuda_patches(force=__import__("os").environ.get("GOPEX_FORCE_NVML_SAFE", "").strip().lower() in ("1", "true", "yes"))
+    pin_training_cuda_device()
 except Exception:
     pass

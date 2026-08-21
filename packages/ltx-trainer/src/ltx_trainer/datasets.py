@@ -1,3 +1,4 @@
+import inspect
 import os
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -139,8 +140,25 @@ class PrecomputedDataset(Dataset):
         self.source_paths = self._setup_source_paths()
         self.sample_files = self._discover_samples()
         self._validate_setup()
+        self.project_groups = self._build_project_groups()
+        self.sample_projects = self._build_sample_projects()
         if self.caption_index:
             self._validate_caption_coverage()
+
+    def _latent_rel_paths(self) -> list[Path]:
+        first_key = next(iter(self.sample_files.keys()))
+        latent_key = "latent_conditions" if "latent_conditions" in self.sample_files else first_key
+        return list(self.sample_files[latent_key])
+
+    def _build_project_groups(self) -> dict[str, list[int]]:
+        from ltx_trainer.project_sampling import build_project_groups
+
+        return build_project_groups(self._latent_rel_paths())
+
+    def _build_sample_projects(self) -> list[str]:
+        from ltx_trainer.project_sampling import project_slug_from_latent_path
+
+        return [project_slug_from_latent_path(rel) for rel in self._latent_rel_paths()]
 
     @staticmethod
     def _setup_data_root(data_root: str) -> Path:
@@ -432,7 +450,7 @@ class PrecomputedDataset(Dataset):
         # Pass 1: Glob all sources in parallel, build full-path sets
         def _glob_source(dir_name: str) -> tuple[list[Path], set[str]]:
             source_path = self.source_paths[dir_name]
-            paths = list(source_path.glob("**/*.pt"))
+            paths = self._glob_pt_files(source_path)
             path_set = {str(p) for p in paths}
             return paths, path_set
 
@@ -489,6 +507,26 @@ class PrecomputedDataset(Dataset):
 
         return sample_files
 
+    @staticmethod
+    def _glob_pt_files(source_path: Path) -> list[Path]:
+        """List non-empty ``*.pt`` shards, following project-directory symlinks.
+
+        Python 3.13+ ``Path.glob`` does not recurse into symlink dirs unless
+        ``recurse_symlinks=True`` (3.12 followed them by default). Overlay catalogs
+        such as ``merged_native_g4/latents/$project → Expansion`` need that.
+        """
+        glob_kw: dict[str, object] = {}
+        if "recurse_symlinks" in inspect.signature(Path.glob).parameters:
+            glob_kw["recurse_symlinks"] = True
+        found: list[Path] = []
+        for path in source_path.glob("**/*.pt", **glob_kw):
+            try:
+                if path.is_file() and path.stat().st_size > 0:
+                    found.append(path)
+            except OSError:
+                continue
+        return found
+
     def _get_expected_file_path(self, dir_name: str, data_file: Path, rel_path: Path) -> Path:
         """Get the expected file path for a given data source."""
         source_path = self.source_paths[dir_name]
@@ -542,6 +580,17 @@ class PrecomputedDataset(Dataset):
         return len(self.sample_files[first_key])
 
     def __getitem__(self, index: int) -> dict[str, torch.Tensor]:
+        n = len(self)
+        last_error: Exception | None = None
+        for offset in range(min(8, n)):
+            try:
+                return self._load_index((index + offset) % n)
+            except Exception as exc:  # noqa: BLE001 — skip USB/zip bit-rot, keep the step alive
+                last_error = exc
+                logger.warning("Skipping unreadable sample %s: %s", (index + offset) % n, exc)
+        raise RuntimeError(f"Failed to load sample {index} after retries: {last_error}") from last_error
+
+    def _load_index(self, index: int) -> dict[str, torch.Tensor]:
         result = {}
 
         for dir_name, output_key in self.data_sources.items():
@@ -551,6 +600,7 @@ class PrecomputedDataset(Dataset):
 
             try:
                 data = torch.load(file_path, map_location="cpu", weights_only=True)
+                data = self._sanitize_loaded_shard(data)
 
                 # Normalize video latent format if this is a latent source
                 if "latent" in dir_name.lower():
@@ -579,7 +629,28 @@ class PrecomputedDataset(Dataset):
 
         # Add index for debugging
         result["idx"] = index
+        if self.sample_projects:
+            result["project"] = self.sample_projects[index]
         return result
+
+    @staticmethod
+    def _sanitize_loaded_shard(data: object) -> object:
+        """Drop ``None`` leaves so DataLoader default collate can stack fold sidecars."""
+
+        if isinstance(data, dict):
+            out: dict = {}
+            for key, value in data.items():
+                if value is None:
+                    continue
+                cleaned = PrecomputedDataset._sanitize_loaded_shard(value)
+                if cleaned is not None:
+                    out[key] = cleaned
+            return out
+        if isinstance(data, list):
+            return [PrecomputedDataset._sanitize_loaded_shard(v) for v in data if v is not None]
+        if isinstance(data, tuple):
+            return tuple(PrecomputedDataset._sanitize_loaded_shard(v) for v in data if v is not None)
+        return data
 
     @staticmethod
     def _normalize_video_latents(data: dict) -> dict:

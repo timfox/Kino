@@ -12,6 +12,7 @@ from ltx_core.components.noisers import GaussianNoiser
 from ltx_core.components.schedulers import LTX2Scheduler
 from ltx_core.loader import LoraPathStrengthAndSDOps
 from ltx_core.loader.registry import Registry
+from ltx_core.model.transformer.compiling import CompilationConfig
 from ltx_core.model.video_vae import TilingConfig, get_video_chunks_number
 from ltx_core.quantization import QuantizationPolicy
 from ltx_core.types import Audio, VideoPixelShape
@@ -35,16 +36,14 @@ from ltx_pipelines.utils.constants import (
 from ltx_pipelines.utils.denoisers import FactoryGuidedDenoiser, SimpleDenoiser
 from ltx_pipelines.utils.helpers import (
     assert_resolution,
-    cleanup_memory,
     combined_image_conditionings,
-    get_device,
-    offload_image_conditioning_latents_to_cpu,
-    offload_tensors_to_cpu_for_diffusion,
+    resolve_ltx_compute_device,
+    resolve_prompt_gemma_device,
+    resolve_video_decode_device,
+    run_video_decode,
 )
 from ltx_pipelines.utils.media_io import encode_video
 from ltx_pipelines.utils.types import ModalitySpec, OffloadMode
-
-logger = logging.getLogger(__name__)
 
 
 class TI2VidTwoStagesPipeline:
@@ -54,14 +53,6 @@ class TI2VidTwoStagesPipeline:
     full model is used), then Stage 2 upsamples by 2x and refines using a distilled
     LoRA for higher quality output. Supports optional image conditioning via the
     images parameter.
-
-    When ``secondary_device`` is a different CUDA device than ``device``, the spatial
-    upsampler and stage-2 diffusion run on that GPU; stage-1 diffusion, image-conditioning
-    VAE encodes, and final VAE decode stay on ``device``. If the secondary card has **less**
-    VRAM than the primary, Gemma runs on the primary instead (streaming Gemma matches
-    ``offload_mode`` when it is ``CPU``/``DISK`` so a 26B+ LLM is not fully resident before
-    stage-1 denoise; use ``offload_mode=NONE`` for full-GPU Gemma on the primary only when
-    you have proven headroom).
     """
 
     def __init__(
@@ -72,60 +63,40 @@ class TI2VidTwoStagesPipeline:
         gemma_root: str,
         loras: list[LoraPathStrengthAndSDOps],
         device: torch.device | None = None,
+        video_decode_device: torch.device | None = None,
+        video_decode_device_spec: str | None = None,
+        gemma_device: torch.device | None = None,
+        gemma_device_spec: str | None = None,
         quantization: QuantizationPolicy | None = None,
         registry: Registry | None = None,
-        torch_compile: bool = False,
+        compilation_config: CompilationConfig | None = None,
         offload_mode: OffloadMode = OffloadMode.NONE,
-        secondary_device: torch.device | None = None,
     ):
-        self.device = device or get_device()
+        self.device = device or resolve_ltx_compute_device()
         self.dtype = torch.bfloat16
-        self._scheduler = LTX2Scheduler()
-
-        sec = secondary_device
-        if sec is not None:
-            if self.device.type != "cuda" or sec.type != "cuda":
-                raise ValueError("secondary_device is only supported when the primary device is CUDA")
-            if sec.index == self.device.index:
-                sec = None
-        self._secondary_device = sec
-        self._stage_2_device = sec if sec is not None else self.device
-        if sec is not None:
-            prim_mem = torch.cuda.get_device_properties(self.device.index).total_memory
-            sec_mem = torch.cuda.get_device_properties(sec.index).total_memory
-            if sec_mem < prim_mem:
-                prompt_encoder_device = self.device
-                # Keep Gemma off the smaller card, but avoid holding the full LLM on the primary
-                # when the user already chose layer streaming for diffusion (reduces allocator
-                # pressure before stage-1 builds non-block + activations).
-                prompt_offload = offload_mode if offload_mode != OffloadMode.NONE else OffloadMode.NONE
-                logger.info(
-                    "Dual-GPU: Gemma on CUDA %d; stage-2 + upsampler on CUDA %d. Gemma offload=%s "
-                    "(matches diffusion offload when diffusion uses cpu/disk).",
-                    self.device.index,
-                    sec.index,
-                    prompt_offload.value,
-                )
-            else:
-                prompt_encoder_device = self._stage_2_device
-                prompt_offload = offload_mode
+        if video_decode_device is not None:
+            self.video_decode_device = video_decode_device
         else:
-            prompt_encoder_device = self.device
-            prompt_offload = offload_mode
+            self.video_decode_device = resolve_video_decode_device(self.device, video_decode_device_spec)
+        _gemma_dev = (
+            gemma_device if gemma_device is not None else resolve_prompt_gemma_device(self.device, gemma_device_spec)
+        )
+        self._scheduler = LTX2Scheduler()
 
         self.prompt_encoder = PromptEncoder(
             checkpoint_path,
             gemma_root,
             self.dtype,
-            prompt_encoder_device,
+            self.device,
             registry=registry,
-            offload_mode=prompt_offload,
+            offload_mode=offload_mode,
+            gemma_device=_gemma_dev,
         )
         self.image_conditioner = ImageConditioner(checkpoint_path, self.dtype, self.device, registry=registry)
         self.upsampler = VideoUpsampler(
-            checkpoint_path, spatial_upsampler_path, self.dtype, self._stage_2_device, registry=registry
+            checkpoint_path, spatial_upsampler_path, self.dtype, self.device, registry=registry
         )
-        self.video_decoder = VideoDecoder(checkpoint_path, self.dtype, self.device, registry=registry)
+        self.video_decoder = VideoDecoder(checkpoint_path, self.dtype, self.video_decode_device, registry=registry)
         self.audio_decoder = AudioDecoder(checkpoint_path, self.dtype, self.device, registry=registry)
 
         self.stage_1 = DiffusionStage(
@@ -135,17 +106,17 @@ class TI2VidTwoStagesPipeline:
             loras=tuple(loras),
             quantization=quantization,
             registry=registry,
-            torch_compile=torch_compile,
+            compilation_config=compilation_config,
             offload_mode=offload_mode,
         )
         self.stage_2 = DiffusionStage(
             checkpoint_path,
             self.dtype,
-            self._stage_2_device,
+            self.device,
             loras=(*tuple(loras), *distilled_lora),
             quantization=quantization,
             registry=registry,
-            torch_compile=torch_compile,
+            compilation_config=compilation_config,
             offload_mode=offload_mode,
         )
 
@@ -164,21 +135,14 @@ class TI2VidTwoStagesPipeline:
         images: list[ImageConditioningInput],
         tiling_config: TilingConfig | None = None,
         enhance_prompt: bool = False,
-        enhance_prompt_prefix: str | None = None,
         max_batch_size: int = 1,
         stage_1_sigmas: torch.Tensor | None = None,
         stage_2_sigmas: torch.Tensor = STAGE_2_DISTILLED_SIGMAS,
-        hdr_experimental_lumivid_logc3: bool = False,
     ) -> tuple[Iterator[torch.Tensor], Audio]:
         assert_resolution(height=height, width=width, is_two_stage=True)
 
         generator = torch.Generator(device=self.device).manual_seed(seed)
-        noiser_stage_1 = GaussianNoiser(generator=generator)
-        noiser_stage_2 = (
-            noiser_stage_1
-            if self._stage_2_device == self.device
-            else GaussianNoiser(generator=torch.Generator(device=self._stage_2_device).manual_seed(seed))
-        )
+        noiser = GaussianNoiser(generator=generator)
         dtype = torch.bfloat16
 
         ctx_p, ctx_n = self.prompt_encoder(
@@ -186,15 +150,9 @@ class TI2VidTwoStagesPipeline:
             enhance_first_prompt=enhance_prompt,
             enhance_prompt_image=images[0][0] if len(images) > 0 else None,
             enhance_prompt_seed=seed,
-            enhance_prompt_prefix=enhance_prompt_prefix,
         )
         v_context_p, a_context_p = ctx_p.video_encoding, ctx_p.audio_encoding
         v_context_n, a_context_n = ctx_n.video_encoding, ctx_n.audio_encoding
-        del ctx_p, ctx_n
-        v_context_p, a_context_p, v_context_n, a_context_n = offload_tensors_to_cpu_for_diffusion(
-            v_context_p, a_context_p, v_context_n, a_context_n
-        )
-        cleanup_memory()
 
         # Stage 1: Generate video at half resolution with CFG guidance.
         stage_1_output_shape = VideoPixelShape(
@@ -214,8 +172,6 @@ class TI2VidTwoStagesPipeline:
                 device=self.device,
             )
         )
-        offload_image_conditioning_latents_to_cpu(stage_1_conditionings)
-        cleanup_memory()
 
         sigmas = (
             stage_1_sigmas if stage_1_sigmas is not None else self._scheduler.execute(steps=num_inference_steps)
@@ -235,7 +191,7 @@ class TI2VidTwoStagesPipeline:
                 ),
             ),
             sigmas=sigmas,
-            noiser=noiser_stage_1,
+            noiser=noiser,
             width=stage_1_output_shape.width,
             height=stage_1_output_shape.height,
             frames=num_frames,
@@ -246,12 +202,9 @@ class TI2VidTwoStagesPipeline:
         )
 
         # Stage 2: Upsample and refine the video at higher resolution with distilled LoRA.
-        v_up_in = video_state.latent[:1]
-        if self._stage_2_device != self.device:
-            v_up_in = v_up_in.to(self._stage_2_device, non_blocking=True)
-        upscaled_video_latent = self.upsampler(v_up_in)
+        upscaled_video_latent = self.upsampler(video_state.latent[:1])
 
-        stage_2_sigmas = stage_2_sigmas.to(dtype=torch.float32, device=self._stage_2_device)
+        stage_2_sigmas = stage_2_sigmas.to(dtype=torch.float32, device=self.device)
         stage_2_conditionings = self.image_conditioner(
             lambda enc: combined_image_conditionings(
                 images=images,
@@ -262,17 +215,11 @@ class TI2VidTwoStagesPipeline:
                 device=self.device,
             )
         )
-        offload_image_conditioning_latents_to_cpu(stage_2_conditionings)
-        cleanup_memory()
-
-        audio_latent_s2 = audio_state.latent
-        if self._stage_2_device != self.device:
-            audio_latent_s2 = audio_latent_s2.to(self._stage_2_device, non_blocking=True)
 
         video_state, audio_state = self.stage_2(
             denoiser=SimpleDenoiser(v_context=v_context_p, a_context=a_context_p),
             sigmas=stage_2_sigmas,
-            noiser=noiser_stage_2,
+            noiser=noiser,
             width=width,
             height=height,
             frames=num_frames,
@@ -286,28 +233,27 @@ class TI2VidTwoStagesPipeline:
             audio=ModalitySpec(
                 context=a_context_p,
                 noise_scale=stage_2_sigmas[0].item(),
-                initial_latent=audio_latent_s2,
+                initial_latent=audio_state.latent,
             ),
-            max_batch_size=max_batch_size,
         )
 
-        v_lat = video_state.latent
-        a_lat = audio_state.latent
-        if self._stage_2_device != self.device:
-            v_lat = v_lat.to(self.device, non_blocking=True)
-            a_lat = a_lat.to(self.device, non_blocking=True)
-
-        decode_dtype = torch.float32 if hdr_experimental_lumivid_logc3 else torch.uint8
-        decoded_video = self.video_decoder(
-            v_lat, tiling_config, generator, output_dtype=decode_dtype
+        decoded_video = run_video_decode(
+            self.video_decoder,
+            video_state.latent,
+            tiling_config,
+            generator,
+            seed=seed,
+            dtype=dtype,
+            main_device=self.device,
+            decode_device=self.video_decode_device,
         )
-        decoded_audio = self.audio_decoder(a_lat)
+        decoded_audio = self.audio_decoder(audio_state.latent)
         return decoded_video, decoded_audio
 
 
-@torch.inference_mode()
+@torch.no_grad()
 def main() -> None:
-    logging.getLogger().setLevel(logging.INFO)
+    logging.basicConfig(level=logging.INFO)
     checkpoint_path = detect_checkpoint_path()
     params = detect_params(checkpoint_path)
     parser = default_2_stage_arg_parser(params=params)
@@ -319,7 +265,7 @@ def main() -> None:
         gemma_root=args.gemma_root,
         loras=tuple(args.lora) if args.lora else (),
         quantization=args.quantization,
-        torch_compile=args.compile,
+        compilation_config=args.compile,
         offload_mode=args.offload_mode,
     )
     tiling_config = TilingConfig.default()

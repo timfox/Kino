@@ -10,8 +10,9 @@ from ltx_core.types import LatentState, VideoLatentShape
 class VideoConditionByKeyframeIndex(ConditioningItem):
     """
     Conditions video generation on keyframe latents at a specific frame index.
-    Appends keyframe tokens to the latent state with positions offset by frame_idx,
-    and sets denoise strength according to the strength parameter.
+    Appends keyframe tokens to the sequence with positions offset by frame_idx: the keyframe
+    latents become clean-latent tokens (placeholder zeros in the noisy latent) and the denoise
+    mask is set from the strength parameter.
     To add attention masking, wrap with :class:`ConditioningItemAttentionStrengthWrapper`.
     Args:
         keyframes: Keyframe latents [B, C, F, H, W].
@@ -37,11 +38,10 @@ class VideoConditionByKeyframeIndex(ConditioningItem):
         latent_state: LatentState,
         latent_tools: VideoLatentTools,
     ) -> LatentState:
-        keyframes = self.keyframes.to(device=latent_state.latent.device, dtype=latent_state.latent.dtype)
-        tokens = latent_tools.patchifier.patchify(keyframes)
+        tokens = latent_tools.patchifier.patchify(self.keyframes)
         latent_coords = latent_tools.patchifier.get_patch_grid_bounds(
-            output_shape=VideoLatentShape.from_torch_shape(keyframes.shape),
-            device=keyframes.device,
+            output_shape=VideoLatentShape.from_torch_shape(self.keyframes.shape),
+            device=self.keyframes.device,
         )
         positions = get_pixel_coords(
             latent_coords=latent_coords,
@@ -61,8 +61,8 @@ class VideoConditionByKeyframeIndex(ConditioningItem):
         denoise_mask = torch.full(
             size=(*tokens.shape[:2], 1),
             fill_value=1.0 - self.strength,
-            device=keyframes.device,
-            dtype=keyframes.dtype,
+            device=self.keyframes.device,
+            dtype=self.keyframes.dtype,
         )
 
         new_attention_mask = update_attention_mask(
@@ -71,12 +71,12 @@ class VideoConditionByKeyframeIndex(ConditioningItem):
             num_noisy_tokens=latent_tools.target_shape.token_count(),
             num_new_tokens=tokens.shape[1],
             batch_size=tokens.shape[0],
-            device=keyframes.device,
-            dtype=keyframes.dtype,
+            device=self.keyframes.device,
+            dtype=self.keyframes.dtype,
         )
 
         return LatentState(
-            latent=torch.cat([latent_state.latent, tokens], dim=1),
+            latent=torch.cat([latent_state.latent, torch.zeros_like(tokens)], dim=1),
             denoise_mask=torch.cat([latent_state.denoise_mask, denoise_mask], dim=1),
             positions=torch.cat([latent_state.positions, positions], dim=2),
             clean_latent=torch.cat([latent_state.clean_latent, tokens], dim=1),

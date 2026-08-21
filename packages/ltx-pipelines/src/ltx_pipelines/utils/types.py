@@ -7,7 +7,6 @@ from typing import Protocol
 import torch
 
 from ltx_core.components.patchifiers import AudioPatchifier, VideoLatentPatchifier
-from ltx_core.components.protocols import DiffusionStepProtocol
 from ltx_core.conditioning import ConditioningItem
 from ltx_core.model.transformer import X0Model
 from ltx_core.types import LatentState
@@ -41,42 +40,34 @@ class PipelineComponents:
         self.audio_patchifier = AudioPatchifier(patch_size=1)
 
 
-class DenoisingFunc(Protocol):
-    """
-    Protocol for a denoising function used in the LTX pipeline.
-    Args:
-        video_state (LatentState): The current latent state for video.
-        audio_state (LatentState): The current latent state for audio.
-        sigmas (torch.Tensor): A 1D tensor of sigma values for each diffusion step.
-        step_index (int): Index of the current denoising step.
-    Returns:
-        tuple[torch.Tensor, torch.Tensor]: The denoised video and audio tensors.
+@dataclass(frozen=True)
+class DenoisedLatentResult:
+    """Output of one denoiser call for a single modality.
+    ``denoised`` is the final blended prediction for this modality.
+    The remaining fields carry the per-pass raw outputs from ``_guided_denoise``
+    (all ``None`` for ``SimpleDenoiser``).  Denoisers return a
+    ``(video_result, audio_result)`` tuple; either element may be ``None``
+    for absent modalities.
     """
 
-    def __call__(
-        self, video_state: LatentState, audio_state: LatentState, sigmas: torch.Tensor, step_index: int
-    ) -> tuple[torch.Tensor, torch.Tensor]: ...
+    denoised: torch.Tensor
+    uncond: torch.Tensor | None = None
+    cond: torch.Tensor | None = None
+    ptb: torch.Tensor | None = None
+    mod: torch.Tensor | None = None
 
-
-class DenoisingLoopFunc(Protocol):
-    """
-    Protocol for a denoising loop function used in the LTX pipeline.
-    Args:
-        sigmas (torch.Tensor): A 1D tensor of sigma values for each diffusion step.
-        video_state (LatentState): The current latent state for video.
-        audio_state (LatentState): The current latent state for audio.
-        stepper (DiffusionStepProtocol): The diffusion step protocol to use.
-    Returns:
-        tuple[LatentState, LatentState]: The denoised video and audio latent states.
-    """
-
-    def __call__(
-        self,
-        sigmas: torch.Tensor,
-        video_state: LatentState,
-        audio_state: LatentState,
-        stepper: DiffusionStepProtocol,
-    ) -> tuple[torch.Tensor, torch.Tensor]: ...
+    @classmethod
+    def result_or_none(
+        cls,
+        denoised: torch.Tensor | None,
+        uncond: torch.Tensor | None = None,
+        cond: torch.Tensor | None = None,
+        ptb: torch.Tensor | None = None,
+        mod: torch.Tensor | None = None,
+    ) -> DenoisedLatentResult | None:
+        if denoised is None:
+            return None
+        return cls(denoised=denoised, uncond=uncond, cond=cond, ptb=ptb, mod=mod)
 
 
 class Denoiser(Protocol):
@@ -90,7 +81,8 @@ class Denoiser(Protocol):
         sigmas: 1-D tensor of sigma values for each diffusion step.
         step_index: Index of the current denoising step.
     Returns:
-        ``(denoised_video, denoised_audio)`` tensors (either may be ``None``).
+        A ``(video_result, audio_result)`` tuple of :class:`DenoisedLatentResult`,
+        either may be ``None`` for absent modalities.
     """
 
     def __call__(
@@ -100,7 +92,7 @@ class Denoiser(Protocol):
         audio_state: LatentState | None,
         sigmas: torch.Tensor,
         step_index: int,
-    ) -> tuple[torch.Tensor | None, torch.Tensor | None]: ...
+    ) -> tuple[DenoisedLatentResult | None, DenoisedLatentResult | None]: ...
 
 
 @dataclass(frozen=True)
