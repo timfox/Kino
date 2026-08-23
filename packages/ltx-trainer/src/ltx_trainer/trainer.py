@@ -1,8 +1,9 @@
+import json
 import os
 import re
 import time
 import warnings
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Callable
 
@@ -50,6 +51,7 @@ from ltx_trainer.quantization import quantize_model
 from ltx_trainer.sigma_tracker import SigmaBucketTracker
 from ltx_trainer.timestep_samplers import SAMPLERS
 from ltx_trainer.training_state import ConfigFingerprint, RngStates, TrainingState
+from ltx_trainer.timing_events import record as record_timing_event
 from ltx_trainer.training_strategies import get_training_strategy, strategy_requires_audio
 from ltx_trainer.media_formats import is_still_image_path
 from ltx_trainer.utils import open_image_as_srgb, save_image
@@ -58,6 +60,18 @@ from ltx_trainer.video_utils import read_video, save_video
 
 # Disable irrelevant warnings from transformers
 os.environ["TOKENIZERS_PARALLELISM"] = "true"
+
+# Safe accelerator math defaults for bf16 LTX training. These affect fp32
+# accumulation/matmul kernels, not model dtype or the diffusion objective.
+if os.environ.get("GOPEX_FAST_MATH", "1").strip().lower() in ("1", "true", "yes"):
+    try:
+        torch.set_float32_matmul_precision("high")
+        if torch.cuda.is_available():
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+            torch.backends.cudnn.benchmark = True
+    except Exception as exc:
+        warnings.warn(f"GOPEX_FAST_MATH setup skipped: {exc}", RuntimeWarning)
 
 # Silence bitsandbytes warnings about casting
 warnings.filterwarnings(
@@ -238,6 +252,20 @@ class LtxvTrainer:
                     "finetune_text_connectors: validation uses pre-connector features + live connectors each sample."
                 )
 
+    def _write_training_heartbeat(self, *, status: str, step: int, total: int, loss: float | None = None, detail: str = "") -> None:
+        """Publish an atomic machine-readable heartbeat for local dashboards."""
+        if not IS_MAIN_PROCESS:
+            return
+        try:
+            out = Path(self._config.output_dir)
+            out.mkdir(parents=True, exist_ok=True)
+            payload = {"status": status, "step": step, "total": total, "progress": round(100 * step / max(1, total), 3), "loss": loss, "detail": detail, "updated_at": time.time(), "pid": os.getpid()}
+            tmp = out / "training_heartbeat.json.tmp"
+            tmp.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+            os.replace(tmp, out / "training_heartbeat.json")
+        except OSError as exc:
+            logger.debug("Unable to write training heartbeat: %s", exc)
+
     def train(  # noqa: PLR0912, PLR0915
         self,
         disable_progress_bars: bool = False,
@@ -311,6 +339,11 @@ class LtxvTrainer:
         self._transformer.train()
         self._global_step = initial_step
 
+        if IS_MAIN_PROCESS:
+            model_dtypes = sorted({str(p.dtype) for p in self._transformer.parameters()})
+            logger.info("Trainer health check: transformer dtypes=%s; target_dtype=%s; input casting=enabled", model_dtypes, next((p.dtype for p in self._transformer.parameters()), torch.bfloat16))
+        self._write_training_heartbeat(status="loading", step=initial_step, total=cfg.optimization.steps, detail="trainer initialized")
+
         peak_mem_during_training = start_mem
 
         sampled_videos_paths = None
@@ -355,6 +388,12 @@ class LtxvTrainer:
                         )
 
                     output = self._training_step(batch)
+                    if not torch.isfinite(output.loss).all():
+                        raise FloatingPointError(
+                            f"Non-finite loss at step {self._global_step}: "
+                            f"min={output.loss.detach().nan_to_num().min().item():.5g} "
+                            f"max={output.loss.detach().nan_to_num().max().item():.5g}"
+                        )
                     self._accelerator.backward(output.loss.mean())
 
                     if self._accelerator.sync_gradients and cfg.optimization.max_grad_norm > 0:
@@ -410,12 +449,27 @@ class LtxvTrainer:
                     step_time = (time.time() - step_start_time) * cfg.optimization.gradient_accumulation_steps
                     step_loss = output.loss.detach().mean().item()
 
+                    if IS_MAIN_PROCESS and is_optimization_step:
+                        record_timing_event(
+                            self._config.output_dir,
+                            "train_step",
+                            duration_s=step_time,
+                            step=self._global_step,
+                            total=cfg.optimization.steps,
+                            loss=step_loss,
+                            learning_rate=current_lr,
+                            micro_batches=cfg.optimization.gradient_accumulation_steps,
+                            samples_per_step=cfg.optimization.batch_size * cfg.optimization.gradient_accumulation_steps,
+                        )
+
                     progress.update_training(
                         loss=step_loss,
                         lr=current_lr,
                         step_time=step_time,
                         advance=is_optimization_step,
                     )
+                    if is_optimization_step:
+                        self._write_training_heartbeat(status="training", step=self._global_step, total=cfg.optimization.steps, loss=step_loss, detail="optimization step complete")
 
                     # Log metrics to W&B (only on main process and optimization steps)
                     if IS_MAIN_PROCESS and is_optimization_step:
@@ -555,7 +609,17 @@ class LtxvTrainer:
         """Run frozen/trainable connectors; handles cross-GPU when ``GOPEX_CONNECTOR_CUDA_DEVICE`` is set."""
         train_dev = self._accelerator.device
         conn_dev = self._connector_device()
-        additive_mask = convert_to_additive_mask(prompt_mask, video_features.dtype)
+        # Precomputed Gemma features can be float32 while the frozen connector
+        # is loaded in bf16. Match the connector's actual weights before its
+        # attention projections (to_q/to_k/to_v).
+        connector_dtype = next(
+            (p.dtype for p in self._embeddings_processor.video_connector.parameters() if p.is_floating_point()),
+            video_features.dtype,
+        )
+        video_features = video_features.to(dtype=connector_dtype)
+        if audio_features is not None:
+            audio_features = audio_features.to(dtype=connector_dtype)
+        additive_mask = convert_to_additive_mask(prompt_mask, connector_dtype)
         if conn_dev != train_dev:
             video_features = video_features.to(conn_dev)
             if audio_features is not None:
@@ -599,12 +663,37 @@ class LtxvTrainer:
         # Use strategy to prepare training inputs (returns ModelInputs with Modality objects)
         model_inputs = self._training_strategy.prepare_training_inputs(batch, self._timestep_sampler)
 
-        # Run transformer forward pass with Modality-based interface
-        video_pred, audio_pred = self._transformer(
-            video=model_inputs.video,
-            audio=model_inputs.audio,
-            perturbations=None,
+        # Precomputed latents and connector outputs may arrive as float32 while the
+        # LoRA DiT is loaded in bfloat16.  The transformer attention projections
+        # require matching matmul dtypes (notably on Blackwell), so normalize the
+        # tensor inputs at the model boundary.  Keep masks, positions, timesteps,
+        # and loss targets in their numerically appropriate dtypes.
+        model_dtype = next(
+            (p.dtype for p in self._transformer.parameters() if p.dtype in (torch.float16, torch.bfloat16, torch.float32)),
+            torch.bfloat16,
         )
+        if model_inputs.video is not None:
+            model_inputs.video = replace(
+                model_inputs.video,
+                latent=model_inputs.video.latent.to(dtype=model_dtype),
+                context=model_inputs.video.context.to(dtype=model_dtype),
+            )
+        if model_inputs.audio is not None:
+            model_inputs.audio = replace(
+                model_inputs.audio,
+                latent=model_inputs.audio.latent.to(dtype=model_dtype),
+                context=model_inputs.audio.context.to(dtype=model_dtype),
+            )
+
+        # Run transformer forward pass with Modality-based interface
+        autocast_device = self._accelerator.device.type
+        autocast_enabled = autocast_device in ("cuda", "cpu") and model_dtype in (torch.float16, torch.bfloat16)
+        with torch.autocast(device_type=autocast_device, dtype=model_dtype, enabled=autocast_enabled):
+            video_pred, audio_pred = self._transformer(
+                video=model_inputs.video,
+                audio=model_inputs.audio,
+                perturbations=None,
+            )
 
         # Use strategy to compute loss
         loss = self._training_strategy.compute_loss(video_pred, audio_pred, model_inputs)

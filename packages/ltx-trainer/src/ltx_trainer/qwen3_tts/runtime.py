@@ -34,6 +34,7 @@ class Qwen3TtsRuntime:
     """Lazy model cache with attention-specific keys (ComfyUI parity)."""
 
     _cache: dict[tuple[str, str], Any] = {}
+    _deps: tuple[Any, Any] | None = None
 
     def __init__(self, cfg: Qwen3TtsConfig | None = None) -> None:
         self.cfg = cfg or Qwen3TtsConfig()
@@ -41,17 +42,24 @@ class Qwen3TtsRuntime:
 
     @staticmethod
     def _require_qwen_tts():
+        if Qwen3TtsRuntime._deps is not None:
+            return Qwen3TtsRuntime._deps
         try:
             import torch  # noqa: PLC0415
+        except ImportError as exc:
+            raise RuntimeError(
+                f"PyTorch import failed: {exc}"
+            ) from exc
+        try:
             from qwen_tts import Qwen3TTSModel  # noqa: PLC0415
         except ImportError as exc:
             raise RuntimeError(
-                "qwen-tts not installed — run: pip install qwen-tts transformers==4.57.3"
+                f"qwen-tts import failed: {exc}"
             ) from exc
-        return torch, Qwen3TTSModel
+        Qwen3TtsRuntime._deps = (torch, Qwen3TTSModel)
+        return Qwen3TtsRuntime._deps
 
     def _load(self, model_id: str, attention: str = "auto") -> Any:
-        torch, Qwen3TTSModel = self._require_qwen_tts()
         resolved_attn, attn_impl, warning = resolve_attention(attention)  # type: ignore[arg-type]
         if warning:
             print(f"⚠️ [Qwen3-TTS] {warning}")
@@ -59,6 +67,8 @@ class Qwen3TtsRuntime:
         cache_key = (model_id, attn_impl)
         if cache_key in self._cache:
             return self._cache[cache_key]
+
+        torch, Qwen3TTSModel = self._require_qwen_tts()
 
         path = resolve_model_path(model_id)
         device = "cuda:0" if torch.cuda.is_available() else "cpu"

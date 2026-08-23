@@ -519,6 +519,15 @@ class Attention(torch.nn.Module):
         context = x if context is None else context
         use_attention = not all_perturbed
 
+        # RMSNorm and connector residual paths may promote activations to
+        # float32 even when the projection weights are bf16. Linear layers
+        # require matching input/weight dtypes on this backend.
+        projection_dtype = self.to_v.weight.dtype
+        if context.dtype != projection_dtype:
+            context = context.to(dtype=projection_dtype)
+        if x.dtype != projection_dtype:
+            x = x.to(dtype=projection_dtype)
+
         v = self.to_v(context)
 
         if not use_attention:

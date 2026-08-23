@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import re
+import hashlib
+import json
+import os
 from typing import Any
 
 from ltx_trainer.freeusd.config import DEFAULT_TWO_SHOT, FORMAT, FreeUSDConfig, SET_PRIMS, SpatialPose
@@ -49,6 +52,32 @@ def shot_to_usda(
     cont = shot.get("continuity") or {}
     fps = float(shot.get("fps") or cont.get("fps") or cfg.fps)
     frames = int(shot.get("duration_frames") or cont.get("frames") or cfg.frames_default)
+    camera = shot.get("camera") or {}
+    lighting = shot.get("lighting") or {}
+    technical = shot.get("technical") or {}
+    blocking = shot.get("blocking") or {}
+    continuity = shot.get("continuity") or {}
+    cast = shot.get("cast") or []
+    # Keep one queryable JSON envelope in addition to the human-readable USD
+    # attributes below. This makes the layer useful to CID, training audits,
+    # rerender tools, and future DCC importers without inventing another sidecar.
+    prompt = str(shot.get("prompt") or "")
+    context = {
+        "schema": "gopex.usda_context/v1",
+        "production": {"series": shot.get("series"), "season": shot.get("season_number"), "episode": shot.get("episode_number"), "episode_title": shot.get("episode_title"), "production_code": shot.get("production_code"), "act": shot.get("act")},
+        "scenario": {"scene_heading": heading, "scene_slug": shot.get("scene_slug"), "set": shot.get("set_name"), "time_of_day": shot.get("time_of_day"), "beat": beat, "blocking": blocking, "cast": cast, "sound": shot.get("sound") or {}, "continuity": continuity, "shot_context": shot.get("scenario") or {}},
+        "camera": camera, "lighting": lighting,
+        "training": {"product": technical.get("product"), "pipeline": technical.get("pipeline"), "hq": technical.get("hq"), "base": technical.get("base") or os.environ.get("GOPEX_LTX_MODEL_PATH") or os.environ.get("NATIVE_LTX"), "lora": technical.get("lora") or os.environ.get("LORA_CKPT"), "training_run": technical.get("training_run") or os.environ.get("GOPEX_PHASE2_RUN"), "checkpoint_step": technical.get("checkpoint_step") or os.environ.get("GOPEX_CHECKPOINT_STEP"), "sidecar_profile": os.environ.get("GOPEX_AV_FOLD_HOOKS", "")},
+        "prompt": {"sha256": hashlib.sha256(prompt.encode("utf-8")).hexdigest(), "text": prompt},
+        "files": shot.get("files") or {},
+        "evaluation": shot.get("evaluation") or {},
+    }
+    context_json = json.dumps(context, ensure_ascii=False, separators=(",", ":"))
+    evaluation = shot.get("evaluation") or {}
+    scenario = shot.get("scenario") or {}
+    scenario_prompt = str(scenario.get("source_prompt") or "")
+    anchor = str(scenario.get("anchor_reference") or "")
+    resolution = str(scenario.get("resolution") or "")
     lines = [
         "#usda 1.0",
         "(",
@@ -74,6 +103,43 @@ def shot_to_usda(
         f"    custom uniform string gopex_lighting = {_q(cfg.lighting)}",
         f"    custom uniform int gopex_expected_cast = {cfg.expected_cast}",
         f"    custom uniform string gopex_beat = {_q(beat)}",
+        f"    custom uniform string gopex_series = {_q(str(shot.get('series') or ''))}",
+        f"    custom uniform string gopex_production_code = {_q(str(shot.get('production_code') or ''))}",
+        f"    custom uniform string gopex_episode_title = {_q(str(shot.get('episode_title') or ''))}",
+        f"    custom uniform int gopex_season_number = {int(shot.get('season_number') or 1)}",
+        f"    custom uniform int gopex_episode_number = {int(shot.get('episode_number') or 1)}",
+        f"    custom uniform int gopex_scene_number = {int(shot.get('scene_number') or 1)}",
+        f"    custom uniform int gopex_shot_number = {int(shot.get('shot_number') or 1)}",
+        f"    custom uniform int gopex_act = {int(shot.get('act') or 1)}",
+        f"    custom uniform string gopex_set_name = {_q(str(shot.get('set_name') or ''))}",
+        f"    custom uniform string gopex_time_of_day = {_q(str(shot.get('time_of_day') or ''))}",
+        f"    custom uniform string gopex_shot_type = {_q(str(shot.get('shot_type') or ''))}",
+        f"    custom uniform string gopex_camera_move = {_q(str(camera.get('move') or ''))}",
+        f"    custom uniform string gopex_camera_focus = {_q(str(camera.get('focus') or ''))}",
+        f"    custom uniform string gopex_prompt_sha256 = {_q(context['prompt']['sha256'])}",
+        f"    custom uniform string gopex_training_base = {_q(str(context['training'].get('base') or ''))}",
+        f"    custom uniform string gopex_training_lora = {_q(str(context['training'].get('lora') or ''))}",
+        f"    custom uniform string gopex_training_run = {_q(str(context['training'].get('training_run') or ''))}",
+        f"    custom uniform string gopex_sidecar_profile = {_q(str(context['training'].get('sidecar_profile') or ''))}",
+        f"    custom uniform string gopex_scenario_prompt = {_q(scenario_prompt)}",
+        f"    custom uniform string gopex_anchor_reference = {_q(anchor)}",
+        f"    custom uniform string gopex_render_resolution = {_q(resolution)}",
+        f"    custom uniform int gopex_render_frames = {int(scenario.get('frames') or frames)}",
+        f"    custom uniform int gopex_inference_steps = {int(scenario.get('inference_steps') or 0)}",
+        f"    custom uniform int gopex_render_seed = {int(scenario.get('seed') or 0)}",
+        f"    custom uniform bool gopex_quality_ok = {'true' if evaluation.get('quality_ok') is True else 'false'}",
+        f"    custom uniform string gopex_quality_failures = {_q(','.join(str(x) for x in evaluation.get('quality_failures') or []))}",
+        f"    custom uniform string gopex_quality_report = {_q(str(evaluation.get('quality_report') or ''))}",
+        f"    custom uniform string gopex_context_json = {_q(context_json)}",
+        "",
+        '    def Scope "Context" (',
+        '        kind = "component"',
+        "    )",
+        "    {",
+        f"        custom uniform string gopex_context_schema = {_q('gopex.usda_context/v1')}",
+        f"        custom uniform string gopex_context_role = {_q('shot + scenario + training + evaluation')}",
+        f"        custom uniform string gopex_prompt_hash = {_q(context['prompt']['sha256'])}",
+        "    }",
         "",
         '    def Camera "Cam_A" (',
         '        kind = "component"',
