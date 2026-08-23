@@ -58,6 +58,10 @@ pip install -e packages/ltx-core
 - **Quantization** ([`quantization/`](src/ltx_core/quantization/)): FP8 quantization backends for reduced memory footprint and faster inference
 - **Block Streaming** ([`block_streaming/`](src/ltx_core/block_streaming/)): Streams transformer blocks through the GPU one block at a time, so the full model runs on machines without enough memory to hold all its weights at once
 
+### Research reference (NVIDIA SANA)
+
+The repository includes **`third_party/nv-sana`** (submodule), NVlabs’ Apache-2.0 codebase for SANA-Video, LongSANA, and related efficient video diffusion work that composes with **LTX-2** (same VAE family in recent 720p stacks). Use it to compare sampling schedules, long-horizon training recipes, and future **SANA-WM**-style conditioning without duplicating that code inside `ltx-core`.
+
 ### Loader
 
 The `loader/` module provides `SingleGPUModelBuilder`, a frozen dataclass that loads a PyTorch model from `.safetensors` checkpoints and optionally fuses one or more LoRA adapters.
